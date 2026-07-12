@@ -93,6 +93,7 @@ if [ -f "$source_path" ]; then
     [ -n "${ABK_KO_EXTRA_CFLAGS:-}" ] && echo "ccflags-y += ${ABK_KO_EXTRA_CFLAGS}"
     echo "obj-m += ${module_name}.o"
   } > "$module_dir/Kbuild"
+  cp "$module_dir/Kbuild" "$module_dir/Makefile"
 elif [ -d "$source_path" ]; then
   cp -a "$source_path/." "$module_dir/"
   if [ ! -f "$module_dir/Kbuild" ] && [ ! -f "$module_dir/Makefile" ]; then
@@ -104,6 +105,9 @@ elif [ -d "$source_path" ]; then
       [ -n "${ABK_KO_EXTRA_CFLAGS:-}" ] && echo "ccflags-y += ${ABK_KO_EXTRA_CFLAGS}"
       echo "obj-m += ${module_name}.o"
     } > "$module_dir/Kbuild"
+  fi
+  if [ -f "$module_dir/Kbuild" ] && [ ! -f "$module_dir/Makefile" ]; then
+    cp "$module_dir/Kbuild" "$module_dir/Makefile"
   fi
 else
   echo "::error::source 不存在: $source_path"
