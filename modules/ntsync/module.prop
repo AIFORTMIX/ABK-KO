@@ -1,0 +1,2 @@
+author=Rakkashin
+description=修复 Wine/Winlator/Termux 中 /dev/ntsync 的 SELinux 读取和权限（0666）

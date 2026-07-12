@@ -1,0 +1,147 @@
+{
+  "repo_notes": [
+    {
+      "content": "Generate every wiki page in both Chinese and English within the same page. Use this exact content order for every page body: Chinese first, then English. Recommended section headings are '## 中文' and '## English'. Both language sections must cover the same facts, structure, code references, and conclusions. Do not output Chinese-only or English-only pages."
+    },
+    {
+      "content": "Keep the page tree exactly as defined in pages. Every page title is intentionally bilingual in the format '中文标题 / English Title', and parent references must be matched exactly. Keep code symbols, file paths, API names, shell commands, class names, and configuration keys in their original form, but explain them in both Chinese and English."
+    },
+    {
+      "content": "Because this configuration is already close to the 30-page limit, do not split Chinese and English into separate pages. Instead, treat each page as a bilingual page whose navigation title, summary, headings, and body all serve both Chinese and English readers."
+    },
+    {
+      "content": "For page content, make every major section bilingual rather than writing one language as a short summary and the other as the full document. Each page should include: a Chinese summary, an English summary, bilingual section headings in the form '中文小节 / English Section', bilingual explanations for architecture and behavior, and bilingual conclusions when relevant."
+    },
+    {
+      "content": "When using bullet lists, write the Chinese bullets first and then the English bullets with equivalent meaning and comparable detail. When using tables, either duplicate the content in both languages or add bilingual text inside the same cells. Do not leave diagrams, lists, examples, caveats, or API descriptions in only one language."
+    },
+    {
+      "content": "Treat bilingual completeness as a hard requirement. If a page mentions directories, files, workflows, classes, functions, configuration flags, commands, or data formats, explain those items in Chinese and in English. Avoid partial translation, mixed-language fragments, or pages where one language is noticeably less complete than the other."
+    }
+  ],
+  "pages": [
+    {
+      "title": "ABK 项目总览 / ABK Project Overview",
+      "purpose": "Create a bilingual overview of the AnyBase Kernel (ABK) project: project goals, dual-component architecture (CI/CD pipeline plus Android manager app), supported kernel variants, repository layout, and links to all major child sections."
+    },
+    {
+      "title": "入门与仓库结构 / Getting Started & Repository Structure",
+      "purpose": "Create a bilingual guide for repository onboarding: how to fork the repository, configure GitHub Actions, understand the main directories (app/, ddk/, zram/, modules/, config/, data/, web/), and set up the Android manager app for first use.",
+      "parent": "ABK 项目总览 / ABK Project Overview"
+    },
+    {
+      "title": "支持的内核版本与 GKI 数据 / Supported Kernel Versions & GKI Data",
+      "purpose": "Create a bilingual explanation of the supported Android and kernel matrix, the JSON files in data/ that track GKI sub-levels by OS patch level, and the Python scripts that maintain this data.",
+      "parent": "ABK 项目总览 / ABK Project Overview"
+    },
+    {
+      "title": "CI/CD 内核构建流水线 / CI/CD Kernel Build Pipeline",
+      "purpose": "Create a bilingual overview of the GitHub Actions-based kernel build system, including workflow organization, build lifecycle, source synchronization, artifact packaging, and links to detailed child pages."
+    },
+    {
+      "title": "主构建工作流（build.yml） / Main Build Workflow (build.yml)",
+      "purpose": "Create a bilingual deep dive into build.yml: input parameters, patching lifecycle, KernelSU setup, SUSFS integration, feature augmentation, Legacy versus Kleaf build execution, KPM post-processing, and artifact packaging.",
+      "parent": "CI/CD 内核构建流水线 / CI/CD Kernel Build Pipeline"
+    },
+    {
+      "title": "分版本内核工作流 / Per-Version Kernel Workflows",
+      "purpose": "Create bilingual documentation for the per-Android-version workflow files, how they call the reusable build.yml workflow, and how the full-feature matrix workflow is used for broader validation.",
+      "parent": "CI/CD 内核构建流水线 / CI/CD Kernel Build Pipeline"
+    },
+    {
+      "title": "发布编排与管理器获取 / Release Orchestration & Manager Acquisition",
+      "purpose": "Create a bilingual explanation of main.yml, get-manager.yml, KernelSU version calculation, extension module merging, release note generation, and deployment to GitHub Releases.",
+      "parent": "CI/CD 内核构建流水线 / CI/CD Kernel Build Pipeline"
+    },
+    {
+      "title": "构建配置与定制 / Build Configuration & Customization",
+      "purpose": "Create bilingual documentation for config/config, config/stock_defconfig injection, the external module interface, before_build and after_patch stages, and the app signing and security configuration files.",
+      "parent": "CI/CD 内核构建流水线 / CI/CD Kernel Build Pipeline"
+    },
+    {
+      "title": "内核补丁子系统 / Kernel Patch Subsystems",
+      "purpose": "Create a bilingual overview of the specialized kernel-level components integrated into ABK builds, including DDK LSM, ZRAM/LZ4K, and bundled Magisk or KernelSU modules, with links to child pages."
+    },
+    {
+      "title": "星光 DDK LSM / Xingguang DDK LSM",
+      "purpose": "Create bilingual documentation for the Xingguang DDK Linux Security Module: its anti-brick purpose, the code in ddk/xingguang-ddk/, the setup.sh patching script, patch stack, and related Kconfig options.",
+      "parent": "内核补丁子系统 / Kernel Patch Subsystems"
+    },
+    {
+      "title": "ZRAM LZ4K 压缩 / ZRAM LZ4K Compression",
+      "purpose": "Create bilingual documentation for the ZRAM enhancement stack: LZ4 and LZ4HC sources, ARM64 NEON assembly acceleration, apply_lz4_neon.sh patching behavior, and zram.config settings.",
+      "parent": "内核补丁子系统 / Kernel Patch Subsystems"
+    },
+    {
+      "title": "内置内核模块（NTsync 与 IPSet） / Bundled Kernel Modules (NTsync & IPSet)",
+      "purpose": "Create bilingual documentation for the bundled Magisk or KernelSU modules in modules/, including the ntsync and ipset modules, their purpose, and how ABK merges them into a flashable artifact.",
+      "parent": "内核补丁子系统 / Kernel Patch Subsystems"
+    },
+    {
+      "title": "ABK Manager Android 应用 / ABK Manager Android Application",
+      "purpose": "Create a bilingual overview of the Android companion app, its role in managing GitHub forks, dispatching builds, monitoring CI progress, and performing on-device kernel operations."
+    },
+    {
+      "title": "应用架构与构建系统 / App Architecture & Build System",
+      "purpose": "Create bilingual documentation for the Gradle multi-module setup, version catalog, key BuildConfig fields, native CMake and NDK pipeline, signing configuration, and the CI workflow that builds the app and bundles related components.",
+      "parent": "ABK Manager Android 应用 / ABK Manager Android Application"
+    },
+    {
+      "title": "ViewModel 与状态管理 / ViewModel & State Management",
+      "purpose": "Create bilingual documentation for MainViewModel, MainUiState, the AuthStep state machine, build queue lifecycle, ABKP2 build plan serialization, artifact mirroring, and BuildMonitorService integration.",
+      "parent": "ABK Manager Android 应用 / ABK Manager Android Application"
+    },
+    {
+      "title": "GitHub 集成层 / GitHub Integration Layer",
+      "purpose": "Create bilingual documentation for GitHubRepository and GitHubApiService, including OAuth Device Flow, fork management, workflow dispatch and monitoring, artifact and log download, and module catalog fetching.",
+      "parent": "ABK Manager Android 应用 / ABK Manager Android Application"
+    },
+    {
+      "title": "UI 页面与导航 / UI Screens & Navigation",
+      "purpose": "Create bilingual documentation for the screen hierarchy, MainActivity scaffold, Classic and Runtime navigation modes, major screens, predictive back behavior, and Material 3 Expressive design patterns.",
+      "parent": "ABK Manager Android 应用 / ABK Manager Android Application"
+    },
+    {
+      "title": "Root 与内核原生接口 / Root & Kernel Native Interface",
+      "purpose": "Create bilingual documentation for RootUtils, root shell management, partition flashing, AnyKernel3 execution, LKM boot patching, module installation, and the AbkKsuNative JNI bridge and ioctl-based kernel communication.",
+      "parent": "ABK Manager Android 应用 / ABK Manager Android Application"
+    },
+    {
+      "title": "制品下载与刷写流水线 / Artifact Download & Flash Pipeline",
+      "purpose": "Create bilingual documentation for DownloadUtils, artifact classification, safe unzip behavior, prebuilt GKI handling, FlashScreen reconciliation logic, recommendation rules, and flashing operations.",
+      "parent": "ABK Manager Android 应用 / ABK Manager Android Application"
+    },
+    {
+      "title": "Web 仪表盘 / Web Dashboard",
+      "purpose": "Create a bilingual overview of the static web frontend in web/, including the GKI kernel versions dashboard, guide pages, SCSS styling system, JavaScript modules, and announcement data."
+    },
+    {
+      "title": "仪表盘结构与 JavaScript 模块 / Dashboard Structure & JavaScript Modules",
+      "purpose": "Create bilingual documentation for index.html and guide.html structure, and the responsibilities of config.js, render.js, i18n.js, announcement.js, search.js, modal.js, theme.js, back-to-top.js, and related utilities.",
+      "parent": "Web 仪表盘 / Web Dashboard"
+    },
+    {
+      "title": "SCSS 样式系统 / SCSS Styling System",
+      "purpose": "Create bilingual documentation for the SCSS architecture, including base, layout, header, footer, card, table, badges, stats, tabs, modal, search, announcement, lts, back-to-top, and mixin layers.",
+      "parent": "Web 仪表盘 / Web Dashboard"
+    },
+    {
+      "title": "测试与质量保证 / Testing & Quality Assurance",
+      "purpose": "Create a bilingual overview of the project's test infrastructure, including unit test categories, Docker-based test environment, and pull-request validation workflows."
+    },
+    {
+      "title": "单元测试覆盖 / Unit Test Coverage",
+      "purpose": "Create bilingual documentation for the major unit test classes, what behaviors they validate, and how they cover build plan logic, artifact handling, parsing, kernel support, and recommendation logic.",
+      "parent": "测试与质量保证 / Testing & Quality Assurance"
+    },
+    {
+      "title": "CI 测试基础设施 / CI Test Infrastructure",
+      "purpose": "Create bilingual documentation for the GitHub Actions test workflows, Dockerfile.test, docker-compose.yml, and related CI test environment configuration.",
+      "parent": "测试与质量保证 / Testing & Quality Assurance"
+    },
+    {
+      "title": "术语表 / Glossary",
+      "purpose": "Create a bilingual glossary of project-specific terms, abbreviations, and domain concepts, with code pointers that help new contributors navigate the codebase."
+    }
+  ]
+}

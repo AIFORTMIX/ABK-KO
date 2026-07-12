@@ -1,0 +1,358 @@
+name: 编译自定义 KO 模块
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_path:
+        description: "自定义模块源码路径：单个 .c 文件或包含 Kbuild/Makefile 的目录"
+        required: true
+        type: string
+        default: "modules/custom/abk_hello.c"
+      module_name:
+        description: "模块名，不带 .ko 后缀；单 .c 会被复制为 <module_name>.c"
+        required: true
+        type: string
+        default: "abk_hello"
+      android_version:
+        description: "Android 版本"
+        required: true
+        type: choice
+        options:
+          - android12
+          - android13
+          - android14
+          - android15
+          - android16
+        default: android14
+      kernel_version:
+        description: "内核版本"
+        required: true
+        type: choice
+        options:
+          - "5.10"
+          - "5.15"
+          - "6.1"
+          - "6.6"
+          - "6.12"
+        default: "6.1"
+      sub_level:
+        description: "子版本号；批量模式下会从 data/ 自动读取"
+        required: true
+        type: string
+        default: "172"
+      os_patch_level:
+        description: "安全补丁级别，如 2025-07；批量模式下会从 data/ 自动读取"
+        required: true
+        type: string
+        default: "2025-07"
+      build_all_known:
+        description: "是否读取 data/<android>/<kernel>.json 批量编译该 Android/KMI 的全部已知版本"
+        required: false
+        type: boolean
+        default: false
+      include_lts:
+        description: "批量模式下是否包含 LTS 分支"
+        required: false
+        type: boolean
+        default: false
+      kernel_localversion:
+        description: "可选：强制 CONFIG_LOCALVERSION，用于匹配目标设备 uname -r 的后缀"
+        required: false
+        type: string
+        default: ""
+      extra_cflags:
+        description: "可选：追加给外部模块的 ccflags-y"
+        required: false
+        type: string
+        default: ""
+      bazel_lto:
+        description: "Kleaf/Bazel 内核使用的 LTO 模式；6.12 可选 none"
+        required: false
+        type: choice
+        options:
+          - thin
+          - none
+        default: thin
+
+jobs:
+  generate-matrix:
+    name: 生成构建矩阵
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: 生成矩阵
+        id: matrix
+        shell: bash
+        env:
+          ANDROID_VERSION: ${{ inputs.android_version }}
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+          SUB_LEVEL: ${{ inputs.sub_level }}
+          OS_PATCH_LEVEL: ${{ inputs.os_patch_level }}
+          BUILD_ALL_KNOWN: ${{ inputs.build_all_known }}
+          INCLUDE_LTS: ${{ inputs.include_lts }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          android_version = os.environ["ANDROID_VERSION"]
+          kernel_version = os.environ["KERNEL_VERSION"]
+          sub_level = os.environ["SUB_LEVEL"].strip()
+          os_patch_level = os.environ["OS_PATCH_LEVEL"].strip()
+          build_all = os.environ["BUILD_ALL_KNOWN"].lower() == "true"
+          include_lts = os.environ["INCLUDE_LTS"].lower() == "true"
+
+          supported = {
+              ("android12", "5.10"),
+              ("android13", "5.15"),
+              ("android14", "6.1"),
+              ("android15", "6.6"),
+              ("android16", "6.12"),
+          }
+          if (android_version, kernel_version) not in supported:
+              raise SystemExit(
+                  f"不支持的 Android/内核组合: {android_version}/{kernel_version}; "
+                  "支持 android12/5.10, android13/5.15, android14/6.1, android15/6.6, android16/6.12"
+              )
+
+          include = []
+          seen = set()
+
+          if build_all:
+              data_path = Path("data") / android_version / f"{kernel_version}.json"
+              if not data_path.exists():
+                  raise SystemExit(f"未找到版本配置: {data_path}")
+              data = json.loads(data_path.read_text(encoding="utf-8"))
+              for entry in data.get("entries", []):
+                  kernel = str(entry.get("kernel", ""))
+                  date = str(entry.get("date", "")).strip()
+                  if not kernel or not date:
+                      continue
+                  actual_sub = kernel.rsplit(".", 1)[-1]
+                  key = (actual_sub, date)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  include.append({
+                      "android_version": android_version,
+                      "kernel_version": kernel_version,
+                      "sub_level": actual_sub,
+                      "os_patch_level": date,
+                  })
+              if include_lts and data.get("lts"):
+                  include.append({
+                      "android_version": android_version,
+                      "kernel_version": kernel_version,
+                      "sub_level": "X",
+                      "os_patch_level": "lts",
+                  })
+          else:
+              if not sub_level or not os_patch_level:
+                  raise SystemExit("单版本模式必须提供 sub_level 和 os_patch_level")
+              include.append({
+                  "android_version": android_version,
+                  "kernel_version": kernel_version,
+                  "sub_level": sub_level,
+                  "os_patch_level": os_patch_level,
+              })
+
+          if not include:
+              raise SystemExit("构建矩阵为空")
+
+          matrix = {"include": include}
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
+
+          print(json.dumps(matrix, indent=2, ensure_ascii=False))
+          PY
+
+  build-ko:
+    name: "${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.android_version }}-${{ matrix.os_patch_level }}"
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      ABK_KO_SOURCE_PATH: ${{ inputs.source_path }}
+      ABK_KO_MODULE_NAME: ${{ inputs.module_name }}
+      ABK_KO_KERNEL_LOCALVERSION: ${{ inputs.kernel_localversion }}
+      ABK_KO_EXTRA_CFLAGS: ${{ inputs.extra_cflags }}
+      ABK_KO_LTO: ${{ inputs.bazel_lto }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: 构建信息摘要
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### 自定义 KO 模块构建"
+            echo
+            echo "- Source: \`${ABK_KO_SOURCE_PATH}\`"
+            echo "- Module: \`${ABK_KO_MODULE_NAME}.ko\`"
+            echo "- Target: \`${{ matrix.android_version }}/${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}\`"
+            echo "- CONFIG_LOCALVERSION: \`${ABK_KO_KERNEL_LOCALVERSION:-默认}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 校验输入文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -e "$ABK_KO_SOURCE_PATH" ]; then
+            echo "::error::源码路径不存在: $ABK_KO_SOURCE_PATH"
+            exit 1
+          fi
+          if ! [[ "$ABK_KO_MODULE_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "::error::module_name 必须是合法 C/Kbuild 标识符: $ABK_KO_MODULE_NAME"
+            exit 1
+          fi
+
+      - name: 初始化构建环境
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG="${{ matrix.android_version }}-${{ matrix.kernel_version }}-${{ matrix.sub_level }}"
+          KERNEL_ROOT="$GITHUB_WORKSPACE/$CONFIG"
+          mkdir -p "$KERNEL_ROOT"
+          {
+            echo "CONFIG=$CONFIG"
+            echo "KERNEL_ROOT=$KERNEL_ROOT"
+            echo "DEFCONFIG=$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig"
+            echo "REPO=$GITHUB_WORKSPACE/git-repo/repo"
+          } >> "$GITHUB_ENV"
+
+          mkdir -p "$GITHUB_WORKSPACE/git-repo"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
+          chmod 0755 "$GITHUB_WORKSPACE/git-repo/repo"
+          echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
+
+      - name: 安装编译依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves kmod bc
+
+      - name: 配置 ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/bazel
+          ccache --version
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ko-${{ matrix.android_version }}-${{ matrix.kernel_version }}-${{ matrix.sub_level }}-ccache-${{ github.sha }}
+          restore-keys: |
+            ko-${{ matrix.android_version }}-${{ matrix.kernel_version }}-${{ matrix.sub_level }}-ccache-
+
+      - name: 缓存工具链
+        id: cache-toolchain
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernel-build-tools
+          key: ko-toolchain-${{ runner.os }}-v1
+
+      - name: 下载工具链
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://android.googlesource.com/kernel/prebuilts/build-tools -b main-kernel-build-2024 --depth 1 kernel-build-tools
+
+      - name: 初始化并同步内核源码
+        working-directory: ${{ env.KERNEL_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git gcc
+
+          FORMATTED_BRANCH="${{ matrix.android_version }}-${{ matrix.kernel_version }}-${{ matrix.os_patch_level }}"
+          echo "初始化 repo，分支: common-${FORMATTED_BRANCH}"
+
+          "$REPO" init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "common-${FORMATTED_BRANCH}" --repo-rev=v2.16
+
+          REMOTE_BRANCH="$(git ls-remote https://android.googlesource.com/kernel/common "${FORMATTED_BRANCH}" || true)"
+          DEFAULT_MANIFEST_PATH=.repo/manifests/default.xml
+          if grep -q deprecated <<< "$REMOTE_BRANCH"; then
+            echo "检测到已弃用的分支: $FORMATTED_BRANCH"
+            sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" "$DEFAULT_MANIFEST_PATH"
+          fi
+
+          "$REPO" --trace sync -c -j"$(nproc --all)" --no-tags --fail-fast
+          echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> "$GITHUB_ENV"
+
+      - name: 可选匹配目标 uname -r 后缀
+        if: inputs.kernel_localversion != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          defconfig="$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig"
+          if [ ! -f "$defconfig" ]; then
+            echo "::error::未找到 defconfig: $defconfig"
+            exit 1
+          fi
+          if grep -q '^CONFIG_LOCALVERSION=' "$defconfig"; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${ABK_KO_KERNEL_LOCALVERSION}\"|" "$defconfig"
+          else
+            echo "CONFIG_LOCALVERSION=\"${ABK_KO_KERNEL_LOCALVERSION}\"" >> "$defconfig"
+          fi
+          echo "已设置 CONFIG_LOCALVERSION=${ABK_KO_KERNEL_LOCALVERSION}"
+
+      - name: 编译自定义 KO 模块
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build_external_ko.sh
+          out_dir="$GITHUB_WORKSPACE/ko-output/${{ matrix.android_version }}-${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}"
+          scripts/build_external_ko.sh \
+            --kernel-root "$KERNEL_ROOT" \
+            --source "$ABK_KO_SOURCE_PATH" \
+            --module-name "$ABK_KO_MODULE_NAME" \
+            --output-dir "$out_dir"
+          echo "ABK_KO_OUTPUT_DIR=$out_dir" >> "$GITHUB_ENV"
+
+      - name: 写入目标信息
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "android_version=${{ matrix.android_version }}"
+            echo "kernel_version=${{ matrix.kernel_version }}"
+            echo "sub_level=${{ matrix.sub_level }}"
+            echo "os_patch_level=${{ matrix.os_patch_level }}"
+            echo "source_path=${ABK_KO_SOURCE_PATH}"
+            echo "module_name=${ABK_KO_MODULE_NAME}"
+            echo "insmod_hint=请在 uname -r 与 metadata.txt 中 vermagic 主版本/后缀匹配的设备或内核上 insmod"
+          } >> "$ABK_KO_OUTPUT_DIR/target.txt"
+
+      - name: 上传 KO 模块产物
+        uses: actions/upload-artifact@v6
+        with:
+          name: "${{ inputs.module_name }}-${{ matrix.android_version }}-${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}"
+          path: ${{ env.ABK_KO_OUTPUT_DIR }}
+          if-no-files-found: error

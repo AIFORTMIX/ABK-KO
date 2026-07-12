@@ -1,0 +1,8 @@
+type ntsync_device dev_type
+allow untrusted_app ntsync_device chr_file { getattr open read write ioctl }
+allow untrusted_app_25 ntsync_device chr_file { getattr open read write ioctl }
+allow untrusted_app_27 ntsync_device chr_file { getattr open read write ioctl }
+allow shell ntsync_device chr_file { getattr open read write ioctl }
+allow system_server ntsync_device chr_file { getattr open read write ioctl }
+allowxperm untrusted_app ntsync_device chr_file ioctl { 0x4e80 0x4e81 0x4e82 0x4e83 0x4e84 0x4e85 0x4e86 0x4e87 0x4e88 0x4e89 0x4e8a 0x4e8b 0x4e8c 0x4e8d }
+allowxperm shell ntsync_device chr_file ioctl { 0x4e80 0x4e81 0x4e82 0x4e83 0x4e84 0x4e85 0x4e86 0x4e87 0x4e88 0x4e89 0x4e8a 0x4e8b 0x4e8c 0x4e8d }
