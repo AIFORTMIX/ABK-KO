@@ -60,7 +60,7 @@ on:
         type: boolean
         default: false
       kernel_localversion:
-        description: "可选：强制 CONFIG_LOCALVERSION，用于匹配目标设备 uname -r 的后缀"
+        description: "可选：追加到 UTS_RELEASE 的 localversion 后缀，用于匹配目标设备 uname -r"
         required: false
         type: string
         default: ""
@@ -209,7 +209,7 @@ jobs:
             echo "- Source: \`${ABK_KO_SOURCE_PATH}\`"
             echo "- Module: \`${ABK_KO_MODULE_NAME}.ko\`"
             echo "- Target: \`${{ matrix.android_version }}/${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}\`"
-            echo "- CONFIG_LOCALVERSION: \`${ABK_KO_KERNEL_LOCALVERSION:-默认}\`"
+            echo "- localversion: \`${ABK_KO_KERNEL_LOCALVERSION:-默认}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 校验输入文件
@@ -311,17 +311,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          defconfig="$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig"
-          if [ ! -f "$defconfig" ]; then
-            echo "::error::未找到 defconfig: $defconfig"
-            exit 1
-          fi
-          if grep -q '^CONFIG_LOCALVERSION=' "$defconfig"; then
-            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${ABK_KO_KERNEL_LOCALVERSION}\"|" "$defconfig"
-          else
-            echo "CONFIG_LOCALVERSION=\"${ABK_KO_KERNEL_LOCALVERSION}\"" >> "$defconfig"
-          fi
-          echo "已设置 CONFIG_LOCALVERSION=${ABK_KO_KERNEL_LOCALVERSION}"
+          # 不要修改 common/arch/arm64/configs/gki_defconfig。
+          # Android Kleaf 会执行 savedefconfig 校验，直接写 CONFIG_LOCALVERSION 会导致：
+          #   ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig
+          #
+          # Kbuild 会自动读取源码树根目录下的 localversion* 文件并追加到 UTS_RELEASE。
+          # 这里用 localversion-abk-ko 追加目标设备 uname -r 后缀，尽量让 .ko vermagic 匹配设备内核。
+          printf '%s\n' "$ABK_KO_KERNEL_LOCALVERSION" > "$KERNEL_ROOT/common/localversion-abk-ko"
+          echo "已写入 localversion 文件: $KERNEL_ROOT/common/localversion-abk-ko"
+          cat "$KERNEL_ROOT/common/localversion-abk-ko"
 
       - name: 编译自定义 KO 模块
         shell: bash
