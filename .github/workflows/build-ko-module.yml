@@ -317,6 +317,7 @@ jobs:
           #
           # Kbuild 会自动读取源码树根目录下的 localversion* 文件并追加到 UTS_RELEASE。
           # 这里用 localversion-abk-ko 追加目标设备 uname -r 后缀，尽量让 .ko vermagic 匹配设备内核。
+<<<<<<< HEAD
           normalized_localversion="$ABK_KO_KERNEL_LOCALVERSION"
           duplicated_prefix="-${{ matrix.android_version }}-11-"
           if [[ "$normalized_localversion" == "$duplicated_prefix"* ]]; then
@@ -327,6 +328,9 @@ jobs:
             echo "::warning::localversion 仍然较长，可能导致 UTS_RELEASE 超过 Linux 内核 64 字符限制: $normalized_localversion"
           fi
           printf '%s\n' "$normalized_localversion" > "$KERNEL_ROOT/common/localversion-abk-ko"
+=======
+          printf '%s\n' "$ABK_KO_KERNEL_LOCALVERSION" > "$KERNEL_ROOT/common/localversion-abk-ko"
+>>>>>>> ff1594ed4ce20ea3035546e2c37bae67596c119d
           echo "已写入 localversion 文件: $KERNEL_ROOT/common/localversion-abk-ko"
           cat "$KERNEL_ROOT/common/localversion-abk-ko"
 
