@@ -65,8 +65,8 @@ struct mem_module_info {
 #define CMD_WRITE_STRING    _IOW(MEM_DRV_MAGIC, 6, struct mem_rw_params)
 #define CMD_GET_MODULE_BASE _IOR(MEM_DRV_MAGIC, 7, struct mem_module_info)
 
-static char *dev_name = DEFAULT_DEVICE_NAME;
-module_param(dev_name, charp, 0644);
+static char *memdrv_dev_name = DEFAULT_DEVICE_NAME;
+module_param_named(dev_name, memdrv_dev_name, charp, 0644);
 MODULE_PARM_DESC(dev_name, "显式设备名，例如 memdrv 或 memdrv_test，对应 /dev/<dev_name>");
 
 static int major_num;
@@ -385,12 +385,12 @@ static const struct file_operations fops = {
 
 static int __init mem_drv_init(void)
 {
-	if (!valid_device_name(dev_name)) {
-		pr_alert("mem_drv: invalid dev_name=%s\n", dev_name ? dev_name : "(null)");
+	if (!valid_device_name(memdrv_dev_name)) {
+		pr_alert("mem_drv: invalid dev_name=%s\n", memdrv_dev_name ? memdrv_dev_name : "(null)");
 		return -EINVAL;
 	}
 
-	major_num = register_chrdev(0, dev_name, &fops);
+	major_num = register_chrdev(0, memdrv_dev_name, &fops);
 	if (major_num < 0) {
 		pr_alert("mem_drv: failed to register char device\n");
 		return major_num;
@@ -402,18 +402,18 @@ static int __init mem_drv_init(void)
 	mem_class = class_create(THIS_MODULE, CLASS_NAME);
 #endif
 	if (IS_ERR(mem_class)) {
-		unregister_chrdev(major_num, dev_name);
+		unregister_chrdev(major_num, memdrv_dev_name);
 		return PTR_ERR(mem_class);
 	}
 
-	mem_device = device_create(mem_class, NULL, MKDEV(major_num, 0), NULL, "%s", dev_name);
+	mem_device = device_create(mem_class, NULL, MKDEV(major_num, 0), NULL, "%s", memdrv_dev_name);
 	if (IS_ERR(mem_device)) {
 		class_destroy(mem_class);
-		unregister_chrdev(major_num, dev_name);
+		unregister_chrdev(major_num, memdrv_dev_name);
 		return PTR_ERR(mem_device);
 	}
 
-	pr_info("mem_drv: loaded, major=%d, device=/dev/%s\n", major_num, dev_name);
+	pr_info("mem_drv: loaded, major=%d, device=/dev/%s\n", major_num, memdrv_dev_name);
 	return 0;
 }
 
@@ -424,7 +424,7 @@ static void __exit mem_drv_exit(void)
 	if (mem_class)
 		class_destroy(mem_class);
 	if (major_num > 0)
-		unregister_chrdev(major_num, dev_name);
+		unregister_chrdev(major_num, memdrv_dev_name);
 
 	pr_info("mem_drv: unloaded\n");
 }
