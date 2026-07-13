@@ -81,7 +81,7 @@ struct memdrv_batch_item {
 struct memdrv_batch_req {
 	int session_id;
 	int count;
-	struct memdrv_batch_item items[MEMDRV_MAX_BATCH];
+	unsigned long items_ptr;
 };
 
 #define MEMDRV_IOC_ATTACH        _IOWR(MEMDRV_MAGIC, 1, struct memdrv_attach_req)
@@ -488,56 +488,60 @@ static long memdrv_readwrite(struct memdrv_fast_rw __user *argp, bool write)
 
 static long memdrv_batch(struct memdrv_batch_req __user *argp)
 {
-	struct memdrv_batch_req *req;
+	struct memdrv_batch_req req;
+	struct memdrv_batch_item *items;
 	struct task_struct *task = NULL;
 	unsigned long base;
 	int i;
 	int ret;
 
-	req = kzalloc(sizeof(*req), GFP_KERNEL);
-	if (!req)
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+
+	if (req.count < 0 || req.count > MEMDRV_MAX_BATCH || !req.items_ptr)
+		return -EINVAL;
+
+	items = kcalloc(req.count, sizeof(*items), GFP_KERNEL);
+	if (!items)
 		return -ENOMEM;
 
-	if (copy_from_user(req, argp, sizeof(*req))) {
-		kfree(req);
+	if (copy_from_user(items, (void __user *)(uintptr_t)req.items_ptr,
+			   sizeof(*items) * req.count)) {
+		kfree(items);
 		return -EFAULT;
 	}
 
-	if (req->count < 0 || req->count > MEMDRV_MAX_BATCH) {
-		kfree(req);
-		return -EINVAL;
-	}
-
-	ret = session_get_task_and_base(req->session_id, &task, &base);
+	ret = session_get_task_and_base(req.session_id, &task, &base);
 	if (ret != 0) {
-		kfree(req);
+		kfree(items);
 		return ret;
 	}
 
-	for (i = 0; i < req->count; i++) {
+	for (i = 0; i < req.count; i++) {
 		struct memdrv_fast_rw rw;
 
 		memset(&rw, 0, sizeof(rw));
-		rw.session_id = req->session_id;
-		rw.type = req->items[i].type;
-		rw.offset = req->items[i].offset;
-		rw.offset_count = req->items[i].offset_count;
-		memcpy(rw.offsets, req->items[i].offsets, sizeof(rw.offsets));
-		memcpy(&rw.data, &req->items[i].data, sizeof(rw.data));
+		rw.session_id = req.session_id;
+		rw.type = items[i].type;
+		rw.offset = items[i].offset;
+		rw.offset_count = items[i].offset_count;
+		memcpy(rw.offsets, items[i].offsets, sizeof(rw.offsets));
+		memcpy(&rw.data, &items[i].data, sizeof(rw.data));
 
-		req->items[i].status = do_one_rw(task, base, &rw, req->items[i].write != 0);
-		if (req->items[i].status == 0)
-			memcpy(&req->items[i].data, &rw.data, sizeof(req->items[i].data));
+		items[i].status = do_one_rw(task, base, &rw, items[i].write != 0);
+		if (items[i].status == 0)
+			memcpy(&items[i].data, &rw.data, sizeof(items[i].data));
 	}
 
 	put_task_struct(task);
 
-	if (copy_to_user(argp, req, sizeof(*req))) {
-		kfree(req);
+	if (copy_to_user((void __user *)(uintptr_t)req.items_ptr, items,
+			 sizeof(*items) * req.count)) {
+		kfree(items);
 		return -EFAULT;
 	}
 
-	kfree(req);
+	kfree(items);
 	return 0;
 }
 
