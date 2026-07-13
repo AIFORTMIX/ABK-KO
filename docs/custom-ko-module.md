@@ -127,7 +127,7 @@ modinfo -F vermagic my_driver.ko
 kernel_localversion = -android14-11-gxxxxxxxxxxxxx-ab123456-4k
 ```
 
-该值会写入 `CONFIG_LOCALVERSION`，用于尽量匹配目标设备的 `vermagic`。如果只是给 ABK 自己编译出的同一内核加载模块，建议保持与内核构建时的 localversion 一致。
+该值会写入内核源码树的 `localversion-abk-ko` 文件，用于尽量追加到 `UTS_RELEASE` 并匹配目标设备的 `vermagic`。不会直接修改 `gki_defconfig`，以避免 Kleaf 的 `savedefconfig` 校验失败。如果只是给 ABK 自己编译出的同一内核加载模块，建议保持与内核构建时的 localversion 一致。
 
 ## 加载示例
 

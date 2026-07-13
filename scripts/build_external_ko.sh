@@ -80,6 +80,24 @@ module_dir="$work_base/$module_name"
 rm -rf "$module_dir"
 mkdir -p "$module_dir"
 
+write_default_makefile() {
+  local target="$1"
+  cat > "$target" <<'EOF'
+KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
+M ?= $(CURDIR)
+
+.PHONY: all modules clean
+
+all: modules
+
+modules:
+	$(MAKE) -C $(KERNEL_SRC) M=$(M) modules
+
+clean:
+	$(MAKE) -C $(KERNEL_SRC) M=$(M) clean
+EOF
+}
+
 if [ -f "$source_path" ]; then
   case "$source_path" in
     *.c) ;;
@@ -93,6 +111,7 @@ if [ -f "$source_path" ]; then
     [ -n "${ABK_KO_EXTRA_CFLAGS:-}" ] && echo "ccflags-y += ${ABK_KO_EXTRA_CFLAGS}"
     echo "obj-m += ${module_name}.o"
   } > "$module_dir/Kbuild"
+  write_default_makefile "$module_dir/Makefile"
 elif [ -d "$source_path" ]; then
   cp -a "$source_path/." "$module_dir/"
   if [ ! -f "$module_dir/Kbuild" ] && [ ! -f "$module_dir/Makefile" ]; then
@@ -104,6 +123,9 @@ elif [ -d "$source_path" ]; then
       [ -n "${ABK_KO_EXTRA_CFLAGS:-}" ] && echo "ccflags-y += ${ABK_KO_EXTRA_CFLAGS}"
       echo "obj-m += ${module_name}.o"
     } > "$module_dir/Kbuild"
+  fi
+  if [ -f "$module_dir/Kbuild" ] && [ ! -f "$module_dir/Makefile" ]; then
+    write_default_makefile "$module_dir/Makefile"
   fi
 else
   echo "::error::source 不存在: $source_path"
