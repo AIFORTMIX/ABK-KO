@@ -86,7 +86,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: 生成矩阵
         id: matrix
@@ -197,7 +197,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: 构建信息摘要
         shell: bash
@@ -262,7 +262,7 @@ jobs:
           echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
 
       - name: 恢复 ccache 缓存
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: ~/.ccache
           key: ko-${{ matrix.android_version }}-${{ matrix.kernel_version }}-${{ matrix.sub_level }}-ccache-${{ github.sha }}
@@ -271,7 +271,7 @@ jobs:
 
       - name: 缓存工具链
         id: cache-toolchain
-        uses: actions/cache@v5
+        uses: actions/cache@v4
         with:
           path: |
             kernel-build-tools
@@ -307,7 +307,7 @@ jobs:
           echo "REMOTE_BRANCH=$REMOTE_BRANCH" >> "$GITHUB_ENV"
 
       - name: 可选匹配目标 uname -r 后缀
-        if: inputs.kernel_localversion != ''
+        if: ${{ inputs.kernel_localversion != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -317,7 +317,6 @@ jobs:
           #
           # Kbuild 会自动读取源码树根目录下的 localversion* 文件并追加到 UTS_RELEASE。
           # 这里用 localversion-abk-ko 追加目标设备 uname -r 后缀，尽量让 .ko vermagic 匹配设备内核。
-<<<<<<< HEAD
           normalized_localversion="$ABK_KO_KERNEL_LOCALVERSION"
           duplicated_prefix="-${{ matrix.android_version }}-11-"
           if [[ "$normalized_localversion" == "$duplicated_prefix"* ]]; then
@@ -328,9 +327,6 @@ jobs:
             echo "::warning::localversion 仍然较长，可能导致 UTS_RELEASE 超过 Linux 内核 64 字符限制: $normalized_localversion"
           fi
           printf '%s\n' "$normalized_localversion" > "$KERNEL_ROOT/common/localversion-abk-ko"
-=======
-          printf '%s\n' "$ABK_KO_KERNEL_LOCALVERSION" > "$KERNEL_ROOT/common/localversion-abk-ko"
->>>>>>> ff1594ed4ce20ea3035546e2c37bae67596c119d
           echo "已写入 localversion 文件: $KERNEL_ROOT/common/localversion-abk-ko"
           cat "$KERNEL_ROOT/common/localversion-abk-ko"
 
@@ -362,7 +358,7 @@ jobs:
           } >> "$ABK_KO_OUTPUT_DIR/target.txt"
 
       - name: 上传 KO 模块产物
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ inputs.module_name }}-${{ matrix.android_version }}-${{ matrix.kernel_version }}.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}"
           path: ${{ env.ABK_KO_OUTPUT_DIR }}
