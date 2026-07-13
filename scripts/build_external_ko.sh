@@ -86,12 +86,15 @@ write_default_makefile() {
 KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
 M ?= $(CURDIR)
 
-.PHONY: all modules clean
+.PHONY: all modules modules_install clean
 
 all: modules
 
 modules:
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) modules
+
+modules_install:
+	$(MAKE) -C $(KERNEL_SRC) M=$(M) modules_install
 
 clean:
 	$(MAKE) -C $(KERNEL_SRC) M=$(M) clean
