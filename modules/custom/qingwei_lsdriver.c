@@ -1,13 +1,8 @@
 // ============================================================================
-// lsdriver.c - 完整版内核模块（硬件断点 + 虚拟触摸 + 内存读写）
-// 基于 Linux 5.4+ / Android 内核，ARM64 架构
+// lsdriver.c - 完整修复版内核模块（硬件断点 + 虚拟触摸 + 内存读写）
+// 适用于 Linux 6.1 / Android 14，ARM64
 // 触摸设备名称包含 "qingwei"
 // 仅供合法安全研究，严禁非法用途
-// ============================================================================
-
-// ============================================================================
-// lsdriver.c - 完整版内核模块（修复编译错误）
-// 基于 Linux 6.1 / Android 14 内核，ARM64
 // ============================================================================
 
 #include <linux/module.h>
@@ -36,22 +31,19 @@
 #include <linux/kallsyms.h>
 #include <linux/kobject.h>
 #include <linux/moduleparam.h>
-#include <linux/kdebug.h>        // ← 新增：die_notifier 声明
+#include <linux/kdebug.h>        // register_die_notifier
+#include <asm/kdebug.h>          // 备用
+#include <linux/d_path.h>        // d_path
 #include <asm/ptrace.h>
 #include <asm/debug-monitors.h>
 #include <asm/hw_breakpoint.h>
 #include <asm/processor.h>
-#include <asm/kdebug.h>          // ← 新增：备用
-
-// ... 其余代码（与之前完全相同，从 MODULE_LICENSE 到 module_init/exit 均不变）...
-// 为节省篇幅，此处省略重复部分，但实际使用时请将下列内容原样复制
-// （即从 MODULE_LICENSE 到最后的 module_exit，全部保留）
-// 注意：只需在文件开头增加上述两个 #include 即可。
+#include <asm/barrier.h>         // isb 宏
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("lsdriver");
 MODULE_DESCRIPTION("Memory debug driver with HW BP & Touch (qingwei)");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.1");
 
 // ============================================================================
 // 1. 协议定义（共享内存）
@@ -103,7 +95,7 @@ struct hwbp_record {
     unsigned long x[30];
     unsigned long fpsr;
     unsigned long fpcr;
-    unsigned long q[32];   // 128位 SIMD 寄存器（仅存低64位，实际可扩展）
+    unsigned long q[32];
     unsigned long hit_count;
 };
 
@@ -139,7 +131,7 @@ struct req_obj {
 // ============================================================================
 // 2. 全局变量
 // ============================================================================
-static struct req_obj *g_req = NULL;                 // 内核映射的共享内存
+static struct req_obj *g_req = NULL;
 static struct task_struct *g_connect_thread = NULL;
 static struct task_struct *g_dispatch_thread = NULL;
 static bool g_connected = false;
@@ -157,20 +149,30 @@ static int g_touch_range_x = 1080;
 static int g_touch_range_y = 1920;
 
 // ============================================================================
-// 3. 模块隐藏（简单实现：从 /sys/module 中删除）
+// 3. 函数原型声明（避免隐式声明）
+// ============================================================================
+static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot);
+static int hwbp_remove(int pid, int slot, int type);
+static int touch_init(void);
+static void touch_cleanup(void);
+static void touch_down(int slot, int x, int y);
+static void touch_move(int slot, int x, int y);
+static void touch_up(int slot);
+
+// ============================================================================
+// 4. 模块隐藏
 // ============================================================================
 static void hide_module(void)
 {
     struct kobject *kobj = &THIS_MODULE->mkobj.kobj;
     if (kobj) {
-        // 删除 sysfs 条目，使 lsmod 不可见（但 /proc/modules 仍可能看到）
         kobject_del(kobj);
         pr_info("lsdriver: module hidden from sysfs\n");
     }
 }
 
 // ============================================================================
-// 4. 内存地址翻译（ARM64 页表遍历）
+// 5. 内存地址翻译（ARM64 页表遍历）
 // ============================================================================
 static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va,
                                    unsigned long *pa)
@@ -211,7 +213,7 @@ static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va,
 }
 
 // ============================================================================
-// 5. 进程内存读写（按页拆分）
+// 6. 进程内存读写（按页拆分）
 // ============================================================================
 static ssize_t virtual_memory_rw(int pid, unsigned long vaddr,
                                   void *buffer, size_t size, bool is_write)
@@ -248,7 +250,6 @@ static ssize_t virtual_memory_rw(int pid, unsigned long vaddr,
 
         ret = mmu_translate_va_to_pa(mm, vaddr + bytes_done, &pa);
         if (ret < 0) {
-            // 不可读页，填充零并继续（按设计允许部分失败）
             if (!is_write)
                 memset((char *)buffer + bytes_done, 0, chunk);
             bytes_done += chunk;
@@ -290,7 +291,7 @@ static ssize_t write_process_memory(int pid, unsigned long vaddr,
 }
 
 // ============================================================================
-// 6. 进程内存布局枚举（获取模块和扫描区域）
+// 7. 进程内存布局枚举（使用 find_vma 替代 vm_next）
 // ============================================================================
 static int virtual_memory_enum(int pid, struct memory_info *info)
 {
@@ -320,7 +321,8 @@ static int virtual_memory_enum(int pid, struct memory_info *info)
     memset(info, 0, sizeof(*info));
 
     down_read(&mm->mmap_lock);
-    for (vma = mm->mmap; vma && mod_count < 32; vma = vma->vm_next) {
+    unsigned long start_addr = 0;
+    while ((vma = find_vma(mm, start_addr)) != NULL && mod_count < 32) {
         char *path = NULL;
         if (vma->vm_file && vma->vm_file->f_path.dentry) {
             char *buf = (char *)__get_free_page(GFP_KERNEL);
@@ -332,7 +334,6 @@ static int virtual_memory_enum(int pid, struct memory_info *info)
         }
 
         if (path) {
-            // 仅收集 /data/ 或 /dev/ 开头的映射作为模块
             if (strncmp(path, "/data/", 6) == 0 ||
                 strncmp(path, "/dev/", 5) == 0) {
                 struct module_info *mod = &info->modules[mod_count];
@@ -349,7 +350,6 @@ static int virtual_memory_enum(int pid, struct memory_info *info)
             free_page((unsigned long)path);
         }
 
-        // 收集私有、可读写区域作为扫描区
         if ((vma->vm_flags & VM_READ) && (vma->vm_flags & VM_WRITE) &&
             !(vma->vm_flags & VM_SHARED) && reg_count < 64) {
             info->regions[reg_count].start = vma->vm_start;
@@ -358,6 +358,9 @@ static int virtual_memory_enum(int pid, struct memory_info *info)
             info->regions[reg_count].index = reg_count;
             reg_count++;
         }
+
+        start_addr = vma->vm_end;
+        if (mod_count >= 32 || reg_count >= 64) break;
     }
     up_read(&mm->mmap_lock);
 
@@ -370,31 +373,23 @@ static int virtual_memory_enum(int pid, struct memory_info *info)
 }
 
 // ============================================================================
-// 7. 硬件断点（ARM64 调试寄存器操作 + 异常通知）
+// 8. 硬件断点（ARM64 调试寄存器操作，固定编号0）
 // ============================================================================
-static inline void write_dbgbvr(int n, unsigned long val)
+static inline void write_dbgbvr0(unsigned long val)
 {
-    asm volatile("msr dbgbvr%d_el1, %0" : : "r"(val) : "memory");
+    asm volatile("msr dbgbvr0_el1, %0" : : "r"(val) : "memory");
 }
-
-static inline void write_dbgbcr(int n, unsigned long val)
+static inline void write_dbgbcr0(unsigned long val)
 {
-    asm volatile("msr dbgbcr%d_el1, %0" : : "r"(val) : "memory");
+    asm volatile("msr dbgbcr0_el1, %0" : : "r"(val) : "memory");
 }
-
-static inline void write_dbgwvr(int n, unsigned long val)
+static inline void write_dbgwvr0(unsigned long val)
 {
-    asm volatile("msr dbgwvr%d_el1, %0" : : "r"(val) : "memory");
+    asm volatile("msr dbgwvr0_el1, %0" : : "r"(val) : "memory");
 }
-
-static inline void write_dbgwcr(int n, unsigned long val)
+static inline void write_dbgwcr0(unsigned long val)
 {
-    asm volatile("msr dbgwcr%d_el1, %0" : : "r"(val) : "memory");
-}
-
-static inline void isb(void)
-{
-    asm volatile("isb" : : : "memory");
+    asm volatile("msr dbgwcr0_el1, %0" : : "r"(val) : "memory");
 }
 
 static int get_num_brps(void)
@@ -411,49 +406,28 @@ static int get_num_wrps(void)
     return ((dfr0 >> 20) & 0xf) + 1;
 }
 
-// 设置断点（直接写当前 CPU 的调试寄存器）
-// 注意：真正的多核环境需要 hook 进程切换，这里简化
 static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot)
 {
-    struct task_struct *task;
-    int num_brps = get_num_brps();
-    int num_wrps = get_num_wrps();
-
-    rcu_read_lock();
-    task = find_task_by_vpid(pid);
-    if (!task) {
-        rcu_read_unlock();
-        return -ESRCH;
-    }
-    get_task_struct(task);
-    rcu_read_unlock();
-
-    // 此处仅演示，实际需在目标进程上 CPU 时写入
+    // 忽略 slot，统一使用编号 0
     if (type == 0) {  // 执行断点
-        int bp_slot = (slot >= 0 && slot < num_brps) ? slot : 0;
-        write_dbgbvr(bp_slot, addr);
-        // BCR: E=1, PAC=3 (EL0+EL1), 执行断点长度固定4字节
-        write_dbgbcr(bp_slot, (1 << 0) | (3 << 1) | (0xf << 5));
+        write_dbgbvr0(addr);
+        write_dbgbcr0((1 << 0) | (3 << 1) | (0xf << 5));
     } else {  // 读/写/读写观察点
-        int wp_slot = (slot >= 0 && slot < num_wrps) ? slot : 0;
-        write_dbgwvr(wp_slot, addr);
+        write_dbgwvr0(addr);
         int lsc = (type == 1) ? 1 : (type == 2) ? 2 : 3;
         int bas = (len == 8) ? 0xff : ((1 << len) - 1);
-        write_dbgwcr(wp_slot, (1 << 0) | (3 << 1) | (lsc << 3) | (bas << 5));
+        write_dbgwcr0((1 << 0) | (3 << 1) | (lsc << 3) | (bas << 5));
     }
-    isb();
-
-    put_task_struct(task);
+    isb();   // 内核宏
     return 0;
 }
 
 static int hwbp_remove(int pid, int slot, int type)
 {
-    if (type == 0) {
-        write_dbgbcr(slot, 0);
-    } else {
-        write_dbgwcr(slot, 0);
-    }
+    if (type == 0)
+        write_dbgbcr0(0);
+    else
+        write_dbgwcr0(0);
     isb();
     return 0;
 }
@@ -470,7 +444,6 @@ static int die_notifier_handler(struct notifier_block *nb,
     if (code != DIE_BREAKPOINT && code != DIE_WATCHPOINT)
         return NOTIFY_DONE;
 
-    // 仅处理用户态断点
     if (user_mode(regs)) {
         spin_lock_irqsave(&g_hwbp_lock, flags);
         if (g_hwbp_record_count < MAX_HWBP_RECORDS) {
@@ -483,7 +456,6 @@ static int die_notifier_handler(struct notifier_block *nb,
                 rec->x[i] = regs->regs[i];
             rec->hit_count = 1;
         } else {
-            // 更新已存在的相同 PC
             for (int i = 0; i < g_hwbp_record_count; i++) {
                 if (g_hwbp_records[i].pc == pc) {
                     g_hwbp_records[i].hit_count++;
@@ -503,7 +475,7 @@ static struct notifier_block g_die_notifier = {
 };
 
 // ============================================================================
-// 8. 虚拟触摸设备（uinput 方式，名称含 "qingwei"）
+// 9. 虚拟触摸设备（uinput，名称含 "qingwei"）
 // ============================================================================
 static int touch_init(void)
 {
@@ -529,7 +501,7 @@ static int touch_init(void)
     input_set_abs_params(g_touch_dev, ABS_MT_POSITION_Y,
                          0, g_touch_range_y, 0, 0);
     input_set_abs_params(g_touch_dev, ABS_MT_TRACKING_ID,
-                         0, 10, 0, 0);  // 10 个触点
+                         0, 10, 0, 0);
 
     err = input_register_device(g_touch_dev);
     if (err) {
@@ -580,7 +552,7 @@ static void touch_up(int slot)
 }
 
 // ============================================================================
-// 9. 请求分发线程
+// 10. 请求分发线程
 // ============================================================================
 static int dispatch_thread_func(void *data)
 {
@@ -593,14 +565,13 @@ static int dispatch_thread_func(void *data)
         }
 
         if (!g_req->kernel) {
-            // 空闲，短暂休眠
             usleep_range(50, 100);
             continue;
         }
 
         unsigned long flags;
         local_irq_save(flags);
-        g_req->kernel = false;   // 消费请求
+        g_req->kernel = false;
 
         switch (g_req->op) {
         case OP_READ:
@@ -673,14 +644,14 @@ static int dispatch_thread_func(void *data)
             break;
         }
 
-        g_req->user = true;      // 标记完成
+        g_req->user = true;
         local_irq_restore(flags);
     }
     return 0;
 }
 
 // ============================================================================
-// 10. 连接线程（查找用户进程 "LS" 并映射共享内存）
+// 11. 连接线程（查找用户进程 "LS" 并映射共享内存）
 // ============================================================================
 static int connect_thread_func(void *data)
 {
@@ -704,7 +675,6 @@ static int connect_thread_func(void *data)
 
                 mm = get_task_mm(task);
                 if (mm) {
-                    // 固定地址映射共享内存
                     ret = get_user_pages_remote(mm, addr, 1,
                                                 FOLL_WRITE, pages,
                                                 NULL, NULL);
@@ -712,7 +682,7 @@ static int connect_thread_func(void *data)
                         g_req = vmap(pages, 1, VM_MAP, PAGE_KERNEL);
                         if (g_req) {
                             memset(g_req, 0, sizeof(*g_req));
-                            g_req->user = true;   // 握手成功
+                            g_req->user = true;
                             g_connected = true;
                             pr_info("lsdriver: connected to LS process (PID=%d)\n",
                                     task->pid);
@@ -734,7 +704,7 @@ static int connect_thread_func(void *data)
 }
 
 // ============================================================================
-// 11. 模块初始化与退出
+// 12. 模块初始化与退出
 // ============================================================================
 static int __init lsdriver_init(void)
 {
@@ -742,20 +712,16 @@ static int __init lsdriver_init(void)
 
     pr_info("lsdriver: initializing...\n");
 
-    // 隐藏模块（从 sysfs 移除）
     hide_module();
 
-    // 初始化触摸设备
     ret = touch_init();
     if (ret)
         pr_warn("lsdriver: touch init failed (%d)\n", ret);
 
-    // 注册断点通知器
     ret = register_die_notifier(&g_die_notifier);
     if (ret)
         pr_warn("lsdriver: die notifier register failed (%d)\n", ret);
 
-    // 启动连接线程
     g_connect_thread = kthread_run(connect_thread_func, NULL,
                                     "lsdriver_conn");
     if (IS_ERR(g_connect_thread)) {
@@ -764,7 +730,6 @@ static int __init lsdriver_init(void)
         goto err_conn;
     }
 
-    // 启动分发线程
     g_dispatch_thread = kthread_run(dispatch_thread_func, NULL,
                                      "lsdriver_disp");
     if (IS_ERR(g_dispatch_thread)) {
@@ -791,7 +756,6 @@ static void __exit lsdriver_exit(void)
 
     g_exiting = true;
 
-    // 通知分发线程退出
     if (g_req && g_connected) {
         g_req->op = OP_KEXIT;
         g_req->kernel = true;
@@ -799,22 +763,17 @@ static void __exit lsdriver_exit(void)
         msleep(100);
     }
 
-    // 停止线程
     if (g_dispatch_thread)
         kthread_stop(g_dispatch_thread);
     if (g_connect_thread)
         kthread_stop(g_connect_thread);
 
-    // 释放共享内存映射
     if (g_req) {
         vunmap(g_req);
         g_req = NULL;
     }
 
-    // 清理触摸设备
     touch_cleanup();
-
-    // 注销断点通知器
     unregister_die_notifier(&g_die_notifier);
 
     pr_info("lsdriver: unloaded\n");
