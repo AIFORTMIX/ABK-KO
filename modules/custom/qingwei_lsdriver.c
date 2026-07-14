@@ -1,6 +1,7 @@
 // ============================================================================
-// qingwei.c - 修改自 lsdriver，去除特征字串，使用 qingwei_client 进程名
+// qingwei.c - 完整功能版（内存读写 + 枚举 + 硬件断点 + 虚拟触摸）
 // 适用于 Linux 6.1 / Android 14，ARM64
+// 优化握手死锁，增强稳定性
 // ============================================================================
 
 #include <linux/module.h>
@@ -22,9 +23,6 @@
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/uinput.h>
-#include <linux/miscdevice.h>
-#include <linux/fs.h>
-#include <linux/device.h>
 #include <linux/notifier.h>
 #include <linux/kallsyms.h>
 #include <linux/kobject.h>
@@ -40,11 +38,11 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
-MODULE_DESCRIPTION("qingwei memory debug driver");
-MODULE_VERSION("2.0");
+MODULE_DESCRIPTION("qingwei full-featured memory driver (HW BP + Touch)");
+MODULE_VERSION("2.2");
 
 // ============================================================================
-// 兼容性定义：如果内核未定义 DIE_* 常量，则手动定义（ARM64 标准值）
+// 兼容性定义
 // ============================================================================
 #ifndef DIE_BREAKPOINT
 #define DIE_BREAKPOINT 7
@@ -168,8 +166,7 @@ static void touch_up(int slot);
 // ============================================================================
 // 4. 模块隐藏
 // ============================================================================
-static void hide_module(void)
-{
+static void hide_module(void) {
     struct kobject *kobj = &THIS_MODULE->mkobj.kobj;
     if (kobj) {
         kobject_del(kobj);
@@ -181,8 +178,7 @@ static void hide_module(void)
 // 5. 内存地址翻译
 // ============================================================================
 static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va,
-                                   unsigned long *pa)
-{
+                                   unsigned long *pa) {
     pgd_t *pgd;
     p4d_t *p4d;
     pud_t *pud;
@@ -222,8 +218,7 @@ static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va,
 // 6. 进程内存读写
 // ============================================================================
 static ssize_t virtual_memory_rw(int pid, unsigned long vaddr,
-                                  void *buffer, size_t size, bool is_write)
-{
+                                  void *buffer, size_t size, bool is_write) {
     struct task_struct *task;
     struct mm_struct *mm;
     unsigned long pa;
@@ -285,22 +280,19 @@ static ssize_t virtual_memory_rw(int pid, unsigned long vaddr,
 }
 
 static ssize_t read_process_memory(int pid, unsigned long vaddr,
-                                    void *buffer, size_t size)
-{
+                                    void *buffer, size_t size) {
     return virtual_memory_rw(pid, vaddr, buffer, size, false);
 }
 
 static ssize_t write_process_memory(int pid, unsigned long vaddr,
-                                     void *buffer, size_t size)
-{
+                                     void *buffer, size_t size) {
     return virtual_memory_rw(pid, vaddr, buffer, size, true);
 }
 
 // ============================================================================
-// 7. 进程内存布局枚举（使用 find_vma）
+// 7. 进程内存布局枚举
 // ============================================================================
-static int virtual_memory_enum(int pid, struct memory_info *info)
-{
+static int virtual_memory_enum(int pid, struct memory_info *info) {
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
@@ -379,27 +371,32 @@ static int virtual_memory_enum(int pid, struct memory_info *info)
 }
 
 // ============================================================================
-// 8. 硬件断点（固定寄存器编号 0）
+// 8. 硬件断点（固定寄存器编号 0，含对齐检查）
 // ============================================================================
-static inline void write_dbgbvr0(unsigned long val)
-{
+static inline void write_dbgbvr0(unsigned long val) {
     asm volatile("msr dbgbvr0_el1, %0" : : "r"(val) : "memory");
 }
-static inline void write_dbgbcr0(unsigned long val)
-{
+static inline void write_dbgbcr0(unsigned long val) {
     asm volatile("msr dbgbcr0_el1, %0" : : "r"(val) : "memory");
 }
-static inline void write_dbgwvr0(unsigned long val)
-{
+static inline void write_dbgwvr0(unsigned long val) {
     asm volatile("msr dbgwvr0_el1, %0" : : "r"(val) : "memory");
 }
-static inline void write_dbgwcr0(unsigned long val)
-{
+static inline void write_dbgwcr0(unsigned long val) {
     asm volatile("msr dbgwcr0_el1, %0" : : "r"(val) : "memory");
 }
 
-static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot)
-{
+static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot) {
+    // 对齐检查
+    if (type == 0 && (addr & 0x3)) {
+        pr_err("qingwei: exec breakpoint address not 4-byte aligned\n");
+        return -EINVAL;
+    }
+    if (type != 0 && (addr & (len - 1))) {
+        pr_err("qingwei: watchpoint address not aligned to length\n");
+        return -EINVAL;
+    }
+
     if (type == 0) {
         write_dbgbvr0(addr);
         write_dbgbcr0((1 << 0) | (3 << 1) | (0xf << 5));
@@ -413,8 +410,7 @@ static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot)
     return 0;
 }
 
-static int hwbp_remove(int pid, int slot, int type)
-{
+static int hwbp_remove(int pid, int slot, int type) {
     if (type == 0)
         write_dbgbcr0(0);
     else
@@ -424,8 +420,7 @@ static int hwbp_remove(int pid, int slot, int type)
 }
 
 static int die_notifier_handler(struct notifier_block *nb,
-                                 unsigned long code, void *arg)
-{
+                                 unsigned long code, void *arg) {
     struct die_args *args = (struct die_args *)arg;
     struct pt_regs *regs = args->regs;
     unsigned long pc = instruction_pointer(regs);
@@ -455,7 +450,6 @@ static int die_notifier_handler(struct notifier_block *nb,
         }
         spin_unlock_irqrestore(&g_hwbp_lock, flags);
     }
-
     return NOTIFY_DONE;
 }
 
@@ -465,10 +459,9 @@ static struct notifier_block g_die_notifier = {
 };
 
 // ============================================================================
-// 9. 虚拟触摸设备（名称含 qingwei）
+// 9. 虚拟触摸设备
 // ============================================================================
-static int touch_init(void)
-{
+static int touch_init(void) {
     int err;
 
     g_touch_dev = input_allocate_device();
@@ -504,16 +497,14 @@ static int touch_init(void)
     return 0;
 }
 
-static void touch_cleanup(void)
-{
+static void touch_cleanup(void) {
     if (g_touch_dev) {
         input_unregister_device(g_touch_dev);
         g_touch_dev = NULL;
     }
 }
 
-static void touch_down(int slot, int x, int y)
-{
+static void touch_down(int slot, int x, int y) {
     if (!g_touch_dev) return;
     input_mt_slot(g_touch_dev, slot);
     input_mt_report_slot_state(g_touch_dev, MT_TOOL_FINGER, true);
@@ -523,8 +514,7 @@ static void touch_down(int slot, int x, int y)
     input_sync(g_touch_dev);
 }
 
-static void touch_move(int slot, int x, int y)
-{
+static void touch_move(int slot, int x, int y) {
     if (!g_touch_dev) return;
     input_mt_slot(g_touch_dev, slot);
     input_report_abs(g_touch_dev, ABS_MT_POSITION_X, x);
@@ -532,8 +522,7 @@ static void touch_move(int slot, int x, int y)
     input_sync(g_touch_dev);
 }
 
-static void touch_up(int slot)
-{
+static void touch_up(int slot) {
     if (!g_touch_dev) return;
     input_mt_slot(g_touch_dev, slot);
     input_mt_report_slot_state(g_touch_dev, MT_TOOL_FINGER, false);
@@ -544,8 +533,7 @@ static void touch_up(int slot)
 // ============================================================================
 // 10. 请求分发线程
 // ============================================================================
-static int dispatch_thread_func(void *data)
-{
+static int dispatch_thread_func(void *data) {
     int ret;
 
     while (!kthread_should_stop() && !g_exiting) {
@@ -641,13 +629,12 @@ static int dispatch_thread_func(void *data)
 }
 
 // ============================================================================
-// 11. 连接线程（寻找进程名为 "qingwei_client"）
+// 11. 连接线程（优化：增加错误处理，避免忙等）
 // ============================================================================
-static int connect_thread_func(void *data)
-{
+static int connect_thread_func(void *data) {
     struct task_struct *task;
     struct mm_struct *mm;
-    struct page *pages[1];
+    struct page *pages[1] = {NULL};
     unsigned long addr = SHARED_MEM_ADDR;
     int ret;
 
@@ -665,21 +652,28 @@ static int connect_thread_func(void *data)
 
                 mm = get_task_mm(task);
                 if (mm) {
-                    ret = get_user_pages_remote(mm, addr, 1,
-                                                FOLL_WRITE, pages,
-                                                NULL, NULL);
-                    if (ret == 1) {
+                    ret = get_user_pages_remote(mm, addr, 1, FOLL_WRITE,
+                                                pages, NULL, NULL);
+                    if (ret == 1 && pages[0] != NULL) {
                         g_req = vmap(pages, 1, VM_MAP, PAGE_KERNEL);
                         if (g_req) {
                             memset(g_req, 0, sizeof(*g_req));
-                            g_req->user = true;
+                            g_req->user = true;   // 握手成功
                             g_connected = true;
                             pr_info("qingwei: connected to client (PID=%d)\n",
                                     task->pid);
+                        } else {
+                            pr_err("qingwei: vmap failed\n");
+                            put_page(pages[0]);
                         }
-                        put_page(pages[0]);
+                    } else {
+                        if (pages[0] != NULL)
+                            put_page(pages[0]);
+                        pr_err("qingwei: get_user_pages_remote failed (ret=%d)\n", ret);
                     }
                     mmput(mm);
+                } else {
+                    pr_err("qingwei: get_task_mm failed\n");
                 }
                 put_task_struct(task);
                 break;
@@ -687,7 +681,7 @@ static int connect_thread_func(void *data)
         }
         if (!g_connected) {
             rcu_read_unlock();
-            msleep(1000);
+            msleep(1000);  // 避免频繁空转
         }
     }
     return 0;
@@ -696,11 +690,8 @@ static int connect_thread_func(void *data)
 // ============================================================================
 // 12. 初始化与退出
 // ============================================================================
-static int __init qingwei_init(void)
-{
+static int __init qingwei_init(void) {
     int ret;
-
-    pr_info("qingwei: initializing...\n");
 
     hide_module();
 
@@ -728,7 +719,7 @@ static int __init qingwei_init(void)
         goto err_disp;
     }
 
-    pr_info("qingwei: loaded successfully\n");
+    pr_info("qingwei: loaded successfully (full feature)\n");
     return 0;
 
 err_disp:
@@ -739,8 +730,7 @@ err_conn:
     return ret;
 }
 
-static void __exit qingwei_exit(void)
-{
+static void __exit qingwei_exit(void) {
     pr_info("qingwei: exiting...\n");
 
     g_exiting = true;
