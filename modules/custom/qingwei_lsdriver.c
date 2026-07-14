@@ -1,8 +1,7 @@
 // ============================================================================
-// lsdriver.c - 完整修复版内核模块（硬件断点 + 虚拟触摸 + 内存读写）
+// lsdriver.c - 完整修复版（修正 d_path 头文件）
 // 适用于 Linux 6.1 / Android 14，ARM64
 // 触摸设备名称包含 "qingwei"
-// 仅供合法安全研究，严禁非法用途
 // ============================================================================
 
 #include <linux/module.h>
@@ -31,19 +30,19 @@
 #include <linux/kallsyms.h>
 #include <linux/kobject.h>
 #include <linux/moduleparam.h>
-#include <linux/kdebug.h>        // register_die_notifier
-#include <asm/kdebug.h>          // 备用
-#include <linux/d_path.h>        // d_path
+#include <linux/kdebug.h>
+#include <asm/kdebug.h>
+#include <linux/dcache.h>          // d_path 声明在此
 #include <asm/ptrace.h>
 #include <asm/debug-monitors.h>
 #include <asm/hw_breakpoint.h>
 #include <asm/processor.h>
-#include <asm/barrier.h>         // isb 宏
+#include <asm/barrier.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("lsdriver");
 MODULE_DESCRIPTION("Memory debug driver with HW BP & Touch (qingwei)");
-MODULE_VERSION("1.1");
+MODULE_VERSION("1.2");
 
 // ============================================================================
 // 1. 协议定义（共享内存）
@@ -137,19 +136,17 @@ static struct task_struct *g_dispatch_thread = NULL;
 static bool g_connected = false;
 static bool g_exiting = false;
 
-// 硬件断点相关
 static struct hwbp_record g_hwbp_records[MAX_HWBP_RECORDS];
 static int g_hwbp_record_count = 0;
 static DEFINE_SPINLOCK(g_hwbp_lock);
 static struct notifier_block g_die_notifier;
 
-// 触摸设备
 static struct input_dev *g_touch_dev = NULL;
 static int g_touch_range_x = 1080;
 static int g_touch_range_y = 1920;
 
 // ============================================================================
-// 3. 函数原型声明（避免隐式声明）
+// 3. 函数原型
 // ============================================================================
 static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot);
 static int hwbp_remove(int pid, int slot, int type);
@@ -172,7 +169,7 @@ static void hide_module(void)
 }
 
 // ============================================================================
-// 5. 内存地址翻译（ARM64 页表遍历）
+// 5. 内存地址翻译
 // ============================================================================
 static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va,
                                    unsigned long *pa)
@@ -213,7 +210,7 @@ static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va,
 }
 
 // ============================================================================
-// 6. 进程内存读写（按页拆分）
+// 6. 进程内存读写
 // ============================================================================
 static ssize_t virtual_memory_rw(int pid, unsigned long vaddr,
                                   void *buffer, size_t size, bool is_write)
@@ -291,7 +288,7 @@ static ssize_t write_process_memory(int pid, unsigned long vaddr,
 }
 
 // ============================================================================
-// 7. 进程内存布局枚举（使用 find_vma 替代 vm_next）
+// 7. 进程内存布局枚举（使用 find_vma）
 // ============================================================================
 static int virtual_memory_enum(int pid, struct memory_info *info)
 {
@@ -373,7 +370,7 @@ static int virtual_memory_enum(int pid, struct memory_info *info)
 }
 
 // ============================================================================
-// 8. 硬件断点（ARM64 调试寄存器操作，固定编号0）
+// 8. 硬件断点（固定寄存器编号 0）
 // ============================================================================
 static inline void write_dbgbvr0(unsigned long val)
 {
@@ -408,17 +405,16 @@ static int get_num_wrps(void)
 
 static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot)
 {
-    // 忽略 slot，统一使用编号 0
-    if (type == 0) {  // 执行断点
+    if (type == 0) {
         write_dbgbvr0(addr);
         write_dbgbcr0((1 << 0) | (3 << 1) | (0xf << 5));
-    } else {  // 读/写/读写观察点
+    } else {
         write_dbgwvr0(addr);
         int lsc = (type == 1) ? 1 : (type == 2) ? 2 : 3;
         int bas = (len == 8) ? 0xff : ((1 << len) - 1);
         write_dbgwcr0((1 << 0) | (3 << 1) | (lsc << 3) | (bas << 5));
     }
-    isb();   // 内核宏
+    isb();
     return 0;
 }
 
@@ -432,7 +428,6 @@ static int hwbp_remove(int pid, int slot, int type)
     return 0;
 }
 
-// 断点异常通知处理器
 static int die_notifier_handler(struct notifier_block *nb,
                                  unsigned long code, void *arg)
 {
@@ -475,7 +470,7 @@ static struct notifier_block g_die_notifier = {
 };
 
 // ============================================================================
-// 9. 虚拟触摸设备（uinput，名称含 "qingwei"）
+// 9. 虚拟触摸设备
 // ============================================================================
 static int touch_init(void)
 {
@@ -651,7 +646,7 @@ static int dispatch_thread_func(void *data)
 }
 
 // ============================================================================
-// 11. 连接线程（查找用户进程 "LS" 并映射共享内存）
+// 11. 连接线程
 // ============================================================================
 static int connect_thread_func(void *data)
 {
@@ -704,7 +699,7 @@ static int connect_thread_func(void *data)
 }
 
 // ============================================================================
-// 12. 模块初始化与退出
+// 12. 初始化与退出
 // ============================================================================
 static int __init lsdriver_init(void)
 {
