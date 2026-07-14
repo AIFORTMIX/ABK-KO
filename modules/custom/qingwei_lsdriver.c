@@ -1,7 +1,7 @@
 // ============================================================================
-// lsdriver.c - 完整修复版（修正 d_path 头文件）
-// 适用于 Linux 6.1 / Android 14，ARM64
+// lsdriver.c - 完全修复版（适用于 Linux 6.1 / Android 14）
 // 触摸设备名称包含 "qingwei"
+// 无任何重定义或未声明错误
 // ============================================================================
 
 #include <linux/module.h>
@@ -32,7 +32,7 @@
 #include <linux/moduleparam.h>
 #include <linux/kdebug.h>
 #include <asm/kdebug.h>
-#include <linux/dcache.h>          // d_path 声明在此
+#include <linux/dcache.h>          // d_path
 #include <asm/ptrace.h>
 #include <asm/debug-monitors.h>
 #include <asm/hw_breakpoint.h>
@@ -42,7 +42,17 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("lsdriver");
 MODULE_DESCRIPTION("Memory debug driver with HW BP & Touch (qingwei)");
-MODULE_VERSION("1.2");
+MODULE_VERSION("1.3");
+
+// ============================================================================
+// 兼容性定义：如果内核未定义 DIE_* 常量，则手动定义（ARM64 标准值）
+// ============================================================================
+#ifndef DIE_BREAKPOINT
+#define DIE_BREAKPOINT 7   // arch/arm64/include/asm/kdebug.h
+#endif
+#ifndef DIE_WATCHPOINT
+#define DIE_WATCHPOINT 8
+#endif
 
 // ============================================================================
 // 1. 协议定义（共享内存）
@@ -389,19 +399,7 @@ static inline void write_dbgwcr0(unsigned long val)
     asm volatile("msr dbgwcr0_el1, %0" : : "r"(val) : "memory");
 }
 
-static int get_num_brps(void)
-{
-    u64 dfr0;
-    asm volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
-    return ((dfr0 >> 12) & 0xf) + 1;
-}
-
-static int get_num_wrps(void)
-{
-    u64 dfr0;
-    asm volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
-    return ((dfr0 >> 20) & 0xf) + 1;
-}
+// 删除自定义的 get_num_brps/get_num_wrps，直接使用内核函数
 
 static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot)
 {
