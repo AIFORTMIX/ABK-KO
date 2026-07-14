@@ -1,7 +1,6 @@
 // ============================================================================
-// lsdriver.c - 最终修复版（无任何编译/链接错误）
+// qingwei.c - 修改自 lsdriver，去除特征字串，使用 qingwei_client 进程名
 // 适用于 Linux 6.1 / Android 14，ARM64
-// 触摸设备名称包含 "qingwei"
 // ============================================================================
 
 #include <linux/module.h>
@@ -40,9 +39,9 @@
 #include <asm/barrier.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("lsdriver");
-MODULE_DESCRIPTION("Memory debug driver with HW BP & Touch (qingwei)");
-MODULE_VERSION("1.4");
+MODULE_AUTHOR("qingwei");
+MODULE_DESCRIPTION("qingwei memory debug driver");
+MODULE_VERSION("2.0");
 
 // ============================================================================
 // 兼容性定义：如果内核未定义 DIE_* 常量，则手动定义（ARM64 标准值）
@@ -174,7 +173,7 @@ static void hide_module(void)
     struct kobject *kobj = &THIS_MODULE->mkobj.kobj;
     if (kobj) {
         kobject_del(kobj);
-        pr_info("lsdriver: module hidden from sysfs\n");
+        pr_info("qingwei: module hidden from sysfs\n");
     }
 }
 
@@ -399,8 +398,6 @@ static inline void write_dbgwcr0(unsigned long val)
     asm volatile("msr dbgwcr0_el1, %0" : : "r"(val) : "memory");
 }
 
-// 不再调用内核的 get_num_brps 等，避免未导出符号
-
 static int hwbp_set(int pid, unsigned long addr, int type, int len, int slot)
 {
     if (type == 0) {
@@ -468,7 +465,7 @@ static struct notifier_block g_die_notifier = {
 };
 
 // ============================================================================
-// 9. 虚拟触摸设备
+// 9. 虚拟触摸设备（名称含 qingwei）
 // ============================================================================
 static int touch_init(void)
 {
@@ -478,7 +475,7 @@ static int touch_init(void)
     if (!g_touch_dev)
         return -ENOMEM;
 
-    g_touch_dev->name = "lsdriver_virtual_touch_qingwei";
+    g_touch_dev->name = "qingwei_touch";
     g_touch_dev->id.bustype = BUS_VIRTUAL;
     __set_bit(EV_SYN, g_touch_dev->evbit);
     __set_bit(EV_KEY, g_touch_dev->evbit);
@@ -503,7 +500,7 @@ static int touch_init(void)
         return err;
     }
 
-    pr_info("lsdriver: touch device '%s' registered\n", g_touch_dev->name);
+    pr_info("qingwei: touch device '%s' registered\n", g_touch_dev->name);
     return 0;
 }
 
@@ -644,7 +641,7 @@ static int dispatch_thread_func(void *data)
 }
 
 // ============================================================================
-// 11. 连接线程
+// 11. 连接线程（寻找进程名为 "qingwei_client"）
 // ============================================================================
 static int connect_thread_func(void *data)
 {
@@ -662,7 +659,7 @@ static int connect_thread_func(void *data)
 
         rcu_read_lock();
         for_each_process(task) {
-            if (strcmp(task->comm, "LS") == 0) {
+            if (strcmp(task->comm, "qingwei_client") == 0) {
                 get_task_struct(task);
                 rcu_read_unlock();
 
@@ -677,7 +674,7 @@ static int connect_thread_func(void *data)
                             memset(g_req, 0, sizeof(*g_req));
                             g_req->user = true;
                             g_connected = true;
-                            pr_info("lsdriver: connected to LS process (PID=%d)\n",
+                            pr_info("qingwei: connected to client (PID=%d)\n",
                                     task->pid);
                         }
                         put_page(pages[0]);
@@ -699,40 +696,39 @@ static int connect_thread_func(void *data)
 // ============================================================================
 // 12. 初始化与退出
 // ============================================================================
-static int __init lsdriver_init(void)
+static int __init qingwei_init(void)
 {
     int ret;
 
-    pr_info("lsdriver: initializing...\n");
+    pr_info("qingwei: initializing...\n");
 
     hide_module();
 
     ret = touch_init();
     if (ret)
-        pr_warn("lsdriver: touch init failed (%d)\n", ret);
+        pr_warn("qingwei: touch init failed (%d)\n", ret);
 
     ret = register_die_notifier(&g_die_notifier);
     if (ret)
-        pr_warn("lsdriver: die notifier register failed (%d)\n", ret);
+        pr_warn("qingwei: die notifier register failed (%d)\n", ret);
 
     g_connect_thread = kthread_run(connect_thread_func, NULL,
-                                    "lsdriver_conn");
+                                    "qingwei_conn");
     if (IS_ERR(g_connect_thread)) {
-        pr_err("lsdriver: failed to create connect thread\n");
+        pr_err("qingwei: failed to create connect thread\n");
         ret = PTR_ERR(g_connect_thread);
         goto err_conn;
     }
 
     g_dispatch_thread = kthread_run(dispatch_thread_func, NULL,
-                                     "lsdriver_disp");
+                                     "qingwei_disp");
     if (IS_ERR(g_dispatch_thread)) {
-        pr_err("lsdriver: failed to create dispatch thread\n");
+        pr_err("qingwei: failed to create dispatch thread\n");
         ret = PTR_ERR(g_dispatch_thread);
         goto err_disp;
     }
 
-    // 移除了 get_num_brps/get_num_wrps 调用，避免未导出符号
-    pr_info("lsdriver: loaded successfully\n");
+    pr_info("qingwei: loaded successfully\n");
     return 0;
 
 err_disp:
@@ -743,9 +739,9 @@ err_conn:
     return ret;
 }
 
-static void __exit lsdriver_exit(void)
+static void __exit qingwei_exit(void)
 {
-    pr_info("lsdriver: exiting...\n");
+    pr_info("qingwei: exiting...\n");
 
     g_exiting = true;
 
@@ -769,8 +765,8 @@ static void __exit lsdriver_exit(void)
     touch_cleanup();
     unregister_die_notifier(&g_die_notifier);
 
-    pr_info("lsdriver: unloaded\n");
+    pr_info("qingwei: unloaded\n");
 }
 
-module_init(lsdriver_init);
-module_exit(lsdriver_exit);
+module_init(qingwei_init);
+module_exit(qingwei_exit);
