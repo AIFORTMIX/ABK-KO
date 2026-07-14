@@ -5,6 +5,11 @@
 // 仅供合法安全研究，严禁非法用途
 // ============================================================================
 
+// ============================================================================
+// lsdriver.c - 完整版内核模块（修复编译错误）
+// 基于 Linux 6.1 / Android 14 内核，ARM64
+// ============================================================================
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -31,10 +36,17 @@
 #include <linux/kallsyms.h>
 #include <linux/kobject.h>
 #include <linux/moduleparam.h>
+#include <linux/kdebug.h>        // ← 新增：die_notifier 声明
 #include <asm/ptrace.h>
 #include <asm/debug-monitors.h>
 #include <asm/hw_breakpoint.h>
 #include <asm/processor.h>
+#include <asm/kdebug.h>          // ← 新增：备用
+
+// ... 其余代码（与之前完全相同，从 MODULE_LICENSE 到 module_init/exit 均不变）...
+// 为节省篇幅，此处省略重复部分，但实际使用时请将下列内容原样复制
+// （即从 MODULE_LICENSE 到最后的 module_exit，全部保留）
+// 注意：只需在文件开头增加上述两个 #include 即可。
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("lsdriver");
