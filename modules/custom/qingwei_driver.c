@@ -1,7 +1,7 @@
 // ============================================================================
 // qingwei_basic.c - 精简稳定版（仅内存读写 + 枚举）
 // 使用 vmalloc + mmap 共享内存，无断点/触摸
-// 适用于 Linux 6.1 / Android 14（已修复所有编译警告）
+// 适用于 Linux 6.1 / Android 14（已修复所有警告）
 // ============================================================================
 
 #include <linux/module.h>
@@ -34,7 +34,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
 MODULE_DESCRIPTION("qingwei basic memory driver (no BP/touch)");
-MODULE_VERSION("3.3");
+MODULE_VERSION("3.4");
 
 // ============================================================================
 // 协议定义
@@ -362,7 +362,6 @@ static struct file_operations qingwei_fops = {
 // ============================================================================
 static int __init qingwei_init(void) {
     dev_t dev;
-    int ret;
     char buf[128];
 
     hide_module();
