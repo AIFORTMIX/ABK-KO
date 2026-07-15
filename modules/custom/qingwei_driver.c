@@ -1,7 +1,6 @@
 // ============================================================================
-// qingwei_basic.c - 精简稳定版（仅内存读写 + 枚举）
-// 使用 vmalloc + mmap 共享内存，无断点/触摸
-// 适用于 Linux 6.1 / Android 14（无文件日志，使用 printk）
+// qingwei_mmap_fixed.c - 支持多页 mmap 的稳定版驱动
+// 使用 alloc_pages 分配连续物理内存，支持任意大小 mmap
 // ============================================================================
 
 #include <linux/module.h>
@@ -25,13 +24,14 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/pagemap.h>
 #include <asm/ptrace.h>
 #include <asm/barrier.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
-MODULE_DESCRIPTION("qingwei basic memory driver (no BP/touch)");
-MODULE_VERSION("3.5");
+MODULE_DESCRIPTION("qingwei mmap fixed driver (multi-page)");
+MODULE_VERSION("3.6");
 
 // ============================================================================
 // 协议定义
@@ -81,7 +81,9 @@ struct req_obj {
 // ============================================================================
 // 全局变量
 // ============================================================================
-static struct req_obj *g_req = NULL;
+static struct req_obj *g_req = NULL;          // 指向连续物理内存的指针
+static struct page *g_pages = NULL;           // 分配的第一个 page 结构
+static unsigned int g_num_pages = 0;          // 页数
 static struct task_struct *g_dispatch_thread = NULL;
 static bool g_exiting = false;
 
@@ -102,7 +104,7 @@ static void hide_module(void) {
 }
 
 // ============================================================================
-// 内存地址翻译
+// 内存地址翻译（同前）
 // ============================================================================
 static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va, unsigned long *pa) {
     pgd_t *pgd = pgd_offset(mm, va);
@@ -297,28 +299,44 @@ static int dispatch_thread_func(void *data) {
 }
 
 // ============================================================================
-// mmap 操作：将 vmalloc 内存映射到用户空间
+// mmap 操作：映射连续物理内存的所有页
 // ============================================================================
 static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long expected_size = sizeof(struct req_obj);
+    unsigned long pfn;
     struct page *page;
+    unsigned long addr;
     int err;
+    int i;
 
-    if (size > PAGE_SIZE) return -EINVAL;
-
-    page = vmalloc_to_page(g_req);
-    if (!page) {
-        pr_err("qingwei: vmalloc_to_page failed\n");
-        return -ENOMEM;
+    // 要求映射大小必须与 req_obj 大小一致（或至少不小于）
+    if (size != expected_size) {
+        pr_err("qingwei: mmap size mismatch: got %lu, expected %lu\n", size, expected_size);
+        return -EINVAL;
     }
 
-    err = remap_pfn_range(vma, vma->vm_start, page_to_pfn(page), size, vma->vm_page_prot);
-    if (err) {
-        pr_err("qingwei: remap_pfn_range failed with %d\n", err);
-        return err;
+    // 计算需要映射的页数
+    unsigned int num_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    if (num_pages != g_num_pages) {
+        pr_err("qingwei: page count mismatch: %u vs %u\n", num_pages, g_num_pages);
+        return -EINVAL;
     }
 
-    pr_info("qingwei: mmap success, user addr 0x%lx, kernel addr %p\n", vma->vm_start, g_req);
+    // 循环映射每一页
+    for (i = 0; i < num_pages; i++) {
+        page = nth_page(g_pages, i);
+        pfn = page_to_pfn(page);
+        addr = vma->vm_start + i * PAGE_SIZE;
+        err = remap_pfn_range(vma, addr, pfn, PAGE_SIZE, vma->vm_page_prot);
+        if (err) {
+            pr_err("qingwei: remap_pfn_range failed at page %d with %d\n", i, err);
+            return err;
+        }
+    }
+
+    pr_info("qingwei: mmap success, %u pages mapped, user addr 0x%lx\n",
+            num_pages, vma->vm_start);
     return 0;
 }
 
@@ -336,23 +354,31 @@ static struct file_operations qingwei_fops = {
 static int __init qingwei_init(void) {
     dev_t dev;
     int ret;
+    unsigned int req_size = sizeof(struct req_obj);
+    unsigned int order = get_order(req_size);
 
     hide_module();
 
-    // 分配共享内存
-    g_req = vmalloc(sizeof(struct req_obj));
-    if (!g_req) {
-        pr_err("qingwei: vmalloc failed\n");
+    // 分配连续物理内存
+    g_pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+    if (!g_pages) {
+        pr_err("qingwei: alloc_pages failed\n");
         return -ENOMEM;
     }
-    memset(g_req, 0, sizeof(struct req_obj));
+    g_num_pages = (1 << order);
+    g_req = page_address(g_pages);
+    if (!g_req) {
+        pr_err("qingwei: page_address failed\n");
+        __free_pages(g_pages, order);
+        return -ENOMEM;
+    }
 
-    pr_info("qingwei: vmalloc addr: 0x%p\n", g_req);
+    pr_info("qingwei: allocated %u pages at %p\n", g_num_pages, g_req);
 
     // 创建字符设备
     if (alloc_chrdev_region(&dev, 0, 1, "qingwei") < 0) {
         pr_err("qingwei: alloc_chrdev_region failed\n");
-        goto err_vfree;
+        goto err_free_pages;
     }
     major = MAJOR(dev);
     cdev_init(&qingwei_cdev, &qingwei_fops);
@@ -361,14 +387,14 @@ static int __init qingwei_init(void) {
     if (ret < 0) {
         pr_err("qingwei: cdev_add failed with %d\n", ret);
         unregister_chrdev_region(dev, 1);
-        goto err_vfree;
+        goto err_free_pages;
     }
     qingwei_class = class_create(THIS_MODULE, "qingwei_class");
     if (IS_ERR(qingwei_class)) {
         pr_err("qingwei: class_create failed\n");
         cdev_del(&qingwei_cdev);
         unregister_chrdev_region(dev, 1);
-        goto err_vfree;
+        goto err_free_pages;
     }
     qingwei_device = device_create(qingwei_class, NULL, dev, NULL, "qingwei");
     if (IS_ERR(qingwei_device)) {
@@ -376,7 +402,7 @@ static int __init qingwei_init(void) {
         class_destroy(qingwei_class);
         cdev_del(&qingwei_cdev);
         unregister_chrdev_region(dev, 1);
-        goto err_vfree;
+        goto err_free_pages;
     }
 
     // 启动分发线程
@@ -387,20 +413,24 @@ static int __init qingwei_init(void) {
         class_destroy(qingwei_class);
         cdev_del(&qingwei_cdev);
         unregister_chrdev_region(dev, 1);
-        goto err_vfree;
+        goto err_free_pages;
     }
 
-    pr_info("qingwei: loaded successfully (vmalloc addr=%p)\n", g_req);
+    pr_info("qingwei: loaded successfully (addr=%p, pages=%u)\n", g_req, g_num_pages);
     return 0;
 
-err_vfree:
-    vfree(g_req);
-    g_req = NULL;
+err_free_pages:
+    if (g_pages) {
+        __free_pages(g_pages, get_order(sizeof(struct req_obj)));
+        g_pages = NULL;
+        g_req = NULL;
+    }
     return -1;
 }
 
 static void __exit qingwei_exit(void) {
     dev_t dev = MKDEV(major, 0);
+    unsigned int order = get_order(sizeof(struct req_obj));
 
     pr_info("qingwei: exiting...\n");
     g_exiting = true;
@@ -419,8 +449,9 @@ static void __exit qingwei_exit(void) {
     cdev_del(&qingwei_cdev);
     unregister_chrdev_region(dev, 1);
 
-    if (g_req) {
-        vfree(g_req);
+    if (g_pages) {
+        __free_pages(g_pages, order);
+        g_pages = NULL;
         g_req = NULL;
     }
 
