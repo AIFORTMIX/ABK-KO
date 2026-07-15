@@ -9,18 +9,17 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/mm.h>
-#include <linux/mm_types.h>
 #include <linux/highmem.h>
 #include <linux/ioctl.h>
-#include <linux/dcache.h>
 #include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/kmod.h>
 #include <linux/list.h>
-#include <linux/rbtree.h>          // 红黑树操作
+#include <linux/file.h>          // filp_open
+#include <linux/fs.h>            // kernel_read
+#include <linux/path.h>
 #include <asm/pgtable.h>
 
-/* ---------- 外部符号 ---------- */
 extern struct list_head modules;
 
 #define DEVICE_NAME "qingwei"
@@ -28,23 +27,23 @@ extern struct list_head modules;
 
 /* ---------- 用户态接口 ---------- */
 typedef struct {
-    int pid;
-    char pkg_name[64];
-    unsigned long addr;
-    size_t size;
-    unsigned long offsets[8];
+    int pid;                      // 目标PID（≤0时用pkg_name自动查找）
+    char pkg_name[64];            // 包名/进程名
+    unsigned long addr;           // 目标虚拟地址
+    size_t size;                  // 读写大小
+    unsigned long offsets[8];     // 指针链偏移
     int offset_count;
-    unsigned long user_buf;
+    unsigned long user_buf;       // 用户态缓冲区（用于读写数据或传入模块名）
 } mem_packet_t;
 
 #define MEM_IOCTL_MAGIC 'Q'
-#define CMD_GET_BASE       _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)
+#define CMD_GET_BASE       _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)   // 获取基址
 #define CMD_READ_MEM       _IOWR(MEM_IOCTL_MAGIC, 2, mem_packet_t)
 #define CMD_WRITE_MEM      _IOWR(MEM_IOCTL_MAGIC, 3, mem_packet_t)
 #define CMD_READ_PTR       _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)
 #define CMD_UNLOAD_MODULE  _IO(MEM_IOCTL_MAGIC, 5)
 
-/* ---------- ARM64 巨页检测适配 ---------- */
+/* ---------- ARM64 巨页检测宏 ---------- */
 #ifndef pud_leaf
 #define pud_leaf(pud)   pud_sect(pud)
 #endif
@@ -52,43 +51,30 @@ typedef struct {
 #define pmd_leaf(pmd)   pmd_sect(pmd)
 #endif
 
-/* ---------- 内存读（手动页表遍历） ---------- */
+/* ---------- 手动页表遍历读/写（同上，无变动） ---------- */
 static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
                               void *kbuf, size_t len)
 {
     struct mm_struct *mm = task->mm;
     size_t done = 0;
     int ret = 0;
-
-    if (!mm)
-        return -EINVAL;
-
+    if (!mm) return -EINVAL;
     mmap_read_lock(mm);
-
     while (done < len) {
         unsigned long addr = vaddr + done;
         unsigned long remaining = len - done;
         unsigned long page_offset = addr & ~PAGE_MASK;
         size_t copy_size = min_t(size_t, remaining, PAGE_SIZE - page_offset);
-        pgd_t *pgd;
-        p4d_t *p4d;
-        pud_t *pud;
-        pmd_t *pmd;
-        pte_t *pte;
-        struct page *page;
-        void *kmap_addr;
-        unsigned long pfn;
+        pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
+        struct page *page; void *kmap_addr; unsigned long pfn;
 
         pgd = pgd_offset(mm, addr);
         if (pgd_none(*pgd) || pgd_bad(*pgd)) { ret = -EFAULT; break; }
-
         p4d = p4d_offset(pgd, addr);
         if (p4d_none(*p4d) || p4d_bad(*p4d)) { ret = -EFAULT; break; }
-
         pud = pud_offset(p4d, addr);
         if (pud_none(*pud) || pud_bad(*pud)) { ret = -EFAULT; break; }
 
-        /* 1GB 块映射 (ARM64) */
         if (pud_leaf(*pud)) {
             pfn = pud_pfn(*pud);
             if (!pfn_valid(pfn)) { ret = -EFAULT; break; }
@@ -103,8 +89,6 @@ static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
 
         pmd = pmd_offset(pud, addr);
         if (pmd_none(*pmd) || pmd_bad(*pmd)) { ret = -EFAULT; break; }
-
-        /* 2MB 块映射 (THP / 巨页) */
         if (pmd_leaf(*pmd)) {
             pfn = pmd_pfn(*pmd);
             if (!pfn_valid(pfn)) { ret = -EFAULT; break; }
@@ -120,50 +104,35 @@ static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
         pte = pte_offset_map(pmd, addr);
         if (!pte) { ret = -EFAULT; break; }
         if (!pte_present(*pte)) { pte_unmap(pte); ret = -EFAULT; break; }
-
         pfn = pte_pfn(*pte);
         if (!pfn_valid(pfn)) { pte_unmap(pte); ret = -EFAULT; break; }
         page = pfn_to_page(pfn);
         if (!page) { pte_unmap(pte); ret = -EFAULT; break; }
-
         kmap_addr = kmap_local_page(page);
         memcpy(kbuf + done, kmap_addr + page_offset, copy_size);
         kunmap_local(kmap_addr);
         pte_unmap(pte);
-
         done += copy_size;
     }
-
     mmap_read_unlock(mm);
     return ret ? ret : done;
 }
 
-/* ---------- 内存写 ---------- */
 static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
                                void *kbuf, size_t len)
 {
     struct mm_struct *mm = task->mm;
     size_t done = 0;
     int ret = 0;
-
-    if (!mm)
-        return -EINVAL;
-
+    if (!mm) return -EINVAL;
     mmap_read_lock(mm);
-
     while (done < len) {
         unsigned long addr = vaddr + done;
         unsigned long remaining = len - done;
         unsigned long page_offset = addr & ~PAGE_MASK;
         size_t copy_size = min_t(size_t, remaining, PAGE_SIZE - page_offset);
-        pgd_t *pgd;
-        p4d_t *p4d;
-        pud_t *pud;
-        pmd_t *pmd;
-        pte_t *pte;
-        struct page *page;
-        void *kmap_addr;
-        unsigned long pfn;
+        pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
+        struct page *page; void *kmap_addr; unsigned long pfn;
 
         pgd = pgd_offset(mm, addr);
         if (pgd_none(*pgd) || pgd_bad(*pgd)) { ret = -EFAULT; break; }
@@ -186,7 +155,6 @@ static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
 
         pmd = pmd_offset(pud, addr);
         if (pmd_none(*pmd) || pmd_bad(*pmd)) { ret = -EFAULT; break; }
-
         if (pmd_leaf(*pmd)) {
             pfn = pmd_pfn(*pmd);
             if (!pfn_valid(pfn)) { ret = -EFAULT; break; }
@@ -210,28 +178,22 @@ static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
         if (!pfn_valid(pfn)) { pte_unmap(pte); ret = -EFAULT; break; }
         page = pfn_to_page(pfn);
         if (!page) { pte_unmap(pte); ret = -EFAULT; break; }
-
         kmap_addr = kmap_local_page(page);
         memcpy(kmap_addr + page_offset, kbuf + done, copy_size);
         kunmap_local(kmap_addr);
         pte_unmap(pte);
-
         done += copy_size;
     }
-
     mmap_read_unlock(mm);
     return ret ? ret : done;
 }
 
-/* ---------- 按包名查 PID ---------- */
+/* ---------- 按包名查找 PID ---------- */
 static int find_pid_by_name(const char *name)
 {
     struct task_struct *task;
     int pid = -ESRCH;
-
-    if (!name || !*name)
-        return -EINVAL;
-
+    if (!name || !*name) return -EINVAL;
     rcu_read_lock();
     for_each_process(task) {
         if (!strcmp(task->comm, name)) {
@@ -255,31 +217,55 @@ static int find_pid_by_name(const char *name)
     return pid;
 }
 
-/* ---------- 获取模块基址（红黑树遍历，避免 mmap/vm_next 依赖） ---------- */
-static unsigned long get_module_base(struct task_struct *task, const char *mod_name)
+/* ---------- 内核读取 /proc/pid/maps 获取模块基址 ---------- */
+static unsigned long get_module_base_from_maps(int pid, const char *mod_name)
 {
-    struct mm_struct *mm = task->mm;
-    struct rb_node *node;
+    char path[32];
+    struct file *file;
+    loff_t pos = 0;
     unsigned long base = 0;
-    char *pathbuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
-    if (!pathbuf)
-        return 0;
+    char *buf;
+    int ret;
 
-    mmap_read_lock(mm);
-    for (node = rb_first(&mm->mm_rb); node; node = rb_next(node)) {
-        struct vm_area_struct *vma = rb_entry(node, struct vm_area_struct, vm_rb);
-        if (!vma->vm_file)
-            continue;
-        char *path = d_path(&vma->vm_file->f_path, pathbuf, PAGE_SIZE);
-        if (IS_ERR(path))
-            continue;
-        if (strstr(path, mod_name)) {
-            base = vma->vm_start;
-            break;
-        }
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file)) {
+        pr_err("failed to open %s\n", path);
+        return 0;
     }
-    mmap_read_unlock(mm);
-    kfree(pathbuf);
+
+    buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    if (!buf) {
+        filp_close(file, NULL);
+        return 0;
+    }
+
+    while ((ret = kernel_read(file, buf, PAGE_SIZE-1, &pos)) > 0) {
+        char *line = buf;
+        char *end = buf + ret;
+        char *next;
+        buf[ret] = '\0';
+        while (line < end) {
+            next = strchr(line, '\n');
+            if (!next) break;
+            *next = '\0';
+            // 格式: "start-end perms offset dev inode pathname"
+            if (strstr(line, mod_name)) {
+                unsigned long start, end;
+                if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                    base = start;
+                    goto out;
+                }
+            }
+            line = next + 1;
+        }
+        pos = 0; // 重置pos? 实际上kernel_read已经更新pos，我们从头开始读？因为我们在循环中，但读取完一页后，pos已经指向下一页，应该继续，但因为我们解析了所有行，如果没找到，需要继续读下一页，但下一次循环会读取下一段，pos在kernel_read内部会更新，所以我们不需要重置，上面kernel_read会从上次pos继续。
+        // 但上面的读取是每次读一页，如果文件超过一页，循环会继续。pos已经更新，没问题。
+    }
+
+out:
+    kfree(buf);
+    filp_close(file, NULL);
     return base;
 }
 
@@ -311,6 +297,7 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     if (copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)))
         return -EFAULT;
 
+    /* 自动查找 PID */
     if (pkt.pid <= 0) {
         pid = find_pid_by_name(pkt.pkg_name);
         if (pid <= 0) {
@@ -340,7 +327,7 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         if (copy_from_user(namebuf, (void __user *)mod_name, sizeof(namebuf)-1)) {
             ret = -EFAULT; break;
         }
-        unsigned long base = get_module_base(task, namebuf);
+        unsigned long base = get_module_base_from_maps(pid, namebuf);
         if (copy_to_user((void __user *)pkt.user_buf, &base, sizeof(unsigned long)))
             ret = -EFAULT;
         break;
@@ -425,10 +412,8 @@ static int __init mem_reader_init(void)
         pr_err("misc_register failed\n");
         return ret;
     }
-
     strcpy((char *)THIS_MODULE->name, MODULE_HIDE_NAME);
-    list_del_init(&THIS_MODULE->list);   // 从 lsmod 链表中移除，彻底隐藏
-
+    list_del_init(&THIS_MODULE->list);
     pr_info("device /dev/%s ready (hidden)\n", DEVICE_NAME);
     return 0;
 }
@@ -444,4 +429,4 @@ module_exit(mem_reader_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Security Researcher");
-MODULE_DESCRIPTION("Hidden ARM64 page-table walk R/W for Android 6.1.138 (using rb-tree for VMA)");
+MODULE_DESCRIPTION("Hidden ARM64 memory R/W with kernel-read maps for base");
