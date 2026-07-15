@@ -1,6 +1,6 @@
 // ============================================================================
-// qingwei_mmap_fixed.c - 支持多页 mmap 的稳定版驱动
-// 使用 alloc_pages 分配连续物理内存，支持任意大小 mmap
+// qingwei_driver.c - 最终稳定版（放宽 mmap 大小限制）
+// 支持任意 ≤ 分配大小的 mmap 长度
 // ============================================================================
 
 #include <linux/module.h>
@@ -30,8 +30,8 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
-MODULE_DESCRIPTION("qingwei mmap fixed driver (multi-page)");
-MODULE_VERSION("3.6");
+MODULE_DESCRIPTION("qingwei mmap fixed driver (relaxed size)");
+MODULE_VERSION("3.8");
 
 // ============================================================================
 // 协议定义
@@ -81,9 +81,10 @@ struct req_obj {
 // ============================================================================
 // 全局变量
 // ============================================================================
-static struct req_obj *g_req = NULL;          // 指向连续物理内存的指针
-static struct page *g_pages = NULL;           // 分配的第一个 page 结构
-static unsigned int g_num_pages = 0;          // 页数
+static struct req_obj *g_req = NULL;
+static struct page *g_pages = NULL;
+static unsigned int g_num_pages = 0;
+static unsigned int g_allocated_size = 0;
 static struct task_struct *g_dispatch_thread = NULL;
 static bool g_exiting = false;
 
@@ -104,7 +105,7 @@ static void hide_module(void) {
 }
 
 // ============================================================================
-// 内存地址翻译（同前）
+// 内存地址翻译
 // ============================================================================
 static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va, unsigned long *pa) {
     pgd_t *pgd = pgd_offset(mm, va);
@@ -299,27 +300,27 @@ static int dispatch_thread_func(void *data) {
 }
 
 // ============================================================================
-// mmap 操作：映射连续物理内存的所有页
+// mmap 操作：仅限制大小不超过分配的总内存
 // ============================================================================
 static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long size = vma->vm_end - vma->vm_start;
-    unsigned long expected_size = sizeof(struct req_obj);
     unsigned long pfn;
     struct page *page;
     unsigned long addr;
     int err;
     int i;
 
-    // 要求映射大小必须与 req_obj 大小一致（或至少不小于）
-    if (size != expected_size) {
-        pr_err("qingwei: mmap size mismatch: got %lu, expected %lu\n", size, expected_size);
+    pr_info("qingwei: mmap called, size=%lu, allocated_size=%u\n", size, g_allocated_size);
+
+    if (size > g_allocated_size) {
+        pr_err("qingwei: mmap size too large: %lu > %u\n", size, g_allocated_size);
         return -EINVAL;
     }
 
     // 计算需要映射的页数
     unsigned int num_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-    if (num_pages != g_num_pages) {
-        pr_err("qingwei: page count mismatch: %u vs %u\n", num_pages, g_num_pages);
+    if (num_pages > g_num_pages) {
+        pr_err("qingwei: requested pages %u > allocated %u\n", num_pages, g_num_pages);
         return -EINVAL;
     }
 
@@ -335,8 +336,7 @@ static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
         }
     }
 
-    pr_info("qingwei: mmap success, %u pages mapped, user addr 0x%lx\n",
-            num_pages, vma->vm_start);
+    pr_info("qingwei: mmap success, %u pages mapped\n", num_pages);
     return 0;
 }
 
@@ -366,6 +366,7 @@ static int __init qingwei_init(void) {
         return -ENOMEM;
     }
     g_num_pages = (1 << order);
+    g_allocated_size = g_num_pages * PAGE_SIZE;
     g_req = page_address(g_pages);
     if (!g_req) {
         pr_err("qingwei: page_address failed\n");
@@ -373,7 +374,8 @@ static int __init qingwei_init(void) {
         return -ENOMEM;
     }
 
-    pr_info("qingwei: allocated %u pages at %p\n", g_num_pages, g_req);
+    pr_info("qingwei: allocated %u pages (%u bytes) at %p\n",
+            g_num_pages, g_allocated_size, g_req);
 
     // 创建字符设备
     if (alloc_chrdev_region(&dev, 0, 1, "qingwei") < 0) {
@@ -416,12 +418,12 @@ static int __init qingwei_init(void) {
         goto err_free_pages;
     }
 
-    pr_info("qingwei: loaded successfully (addr=%p, pages=%u)\n", g_req, g_num_pages);
+    pr_info("qingwei: loaded successfully\n");
     return 0;
 
 err_free_pages:
     if (g_pages) {
-        __free_pages(g_pages, get_order(sizeof(struct req_obj)));
+        __free_pages(g_pages, order);
         g_pages = NULL;
         g_req = NULL;
     }
