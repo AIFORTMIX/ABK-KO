@@ -13,14 +13,9 @@
 #include <linux/ioctl.h>
 #include <linux/version.h>
 #include <linux/slab.h>
-#include <linux/kmod.h>
 #include <linux/list.h>
-#include <linux/file.h>          // filp_open
-#include <linux/fs.h>            // kernel_read
-#include <linux/path.h>
+#include <linux/kallsyms.h>
 #include <asm/pgtable.h>
-
-extern struct list_head modules;
 
 #define DEVICE_NAME "qingwei"
 #define MODULE_HIDE_NAME "vfat"
@@ -31,19 +26,21 @@ typedef struct {
     char pkg_name[64];            // 包名/进程名
     unsigned long addr;           // 目标虚拟地址
     size_t size;                  // 读写大小
-    unsigned long offsets[8];     // 指针链偏移
-    int offset_count;
-    unsigned long user_buf;       // 用户态缓冲区（用于读写数据或传入模块名）
+    unsigned long offsets[8];     // 指针链偏移（最多8级）
+    int offset_count;             // 偏移个数，0表示直接地址
+    unsigned long user_buf;       // 用户态缓冲区（用于传入/传出数据）
 } mem_packet_t;
 
 #define MEM_IOCTL_MAGIC 'Q'
-#define CMD_GET_BASE       _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)   // 获取基址
+#define CMD_GET_BASE       _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)   // 获取模块基址
 #define CMD_READ_MEM       _IOWR(MEM_IOCTL_MAGIC, 2, mem_packet_t)
 #define CMD_WRITE_MEM      _IOWR(MEM_IOCTL_MAGIC, 3, mem_packet_t)
-#define CMD_READ_PTR       _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)
-#define CMD_UNLOAD_MODULE  _IO(MEM_IOCTL_MAGIC, 5)
+#define CMD_READ_PTR       _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)   // 指针链读取
+#define CMD_UNLOAD_PREP    _IO(MEM_IOCTL_MAGIC, 5)                   // 恢复链表，准备卸载
 
-/* ---------- ARM64 巨页检测宏 ---------- */
+static struct list_head *modules_head = NULL;   // 保存 modules 链表头地址
+
+/* ---------- ARM64 巨页检测 ---------- */
 #ifndef pud_leaf
 #define pud_leaf(pud)   pud_sect(pud)
 #endif
@@ -51,7 +48,7 @@ typedef struct {
 #define pmd_leaf(pmd)   pmd_sect(pmd)
 #endif
 
-/* ---------- 手动页表遍历读/写（同上，无变动） ---------- */
+/* ---------- 手动页表遍历读 ---------- */
 static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
                               void *kbuf, size_t len)
 {
@@ -59,6 +56,7 @@ static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
     size_t done = 0;
     int ret = 0;
     if (!mm) return -EINVAL;
+
     mmap_read_lock(mm);
     while (done < len) {
         unsigned long addr = vaddr + done;
@@ -118,6 +116,7 @@ static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
     return ret ? ret : done;
 }
 
+/* ---------- 手动页表遍历写 ---------- */
 static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
                                void *kbuf, size_t len)
 {
@@ -125,6 +124,7 @@ static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
     size_t done = 0;
     int ret = 0;
     if (!mm) return -EINVAL;
+
     mmap_read_lock(mm);
     while (done < len) {
         unsigned long addr = vaddr + done;
@@ -194,6 +194,7 @@ static int find_pid_by_name(const char *name)
     struct task_struct *task;
     int pid = -ESRCH;
     if (!name || !*name) return -EINVAL;
+
     rcu_read_lock();
     for_each_process(task) {
         if (!strcmp(task->comm, name)) {
@@ -217,65 +218,31 @@ static int find_pid_by_name(const char *name)
     return pid;
 }
 
-/* ---------- 内核读取 /proc/pid/maps 获取模块基址 ---------- */
-static unsigned long get_module_base_from_maps(int pid, const char *mod_name)
+/* ---------- 通过 find_vma 遍历 VMA 获取模块基址 ---------- */
+static unsigned long get_module_base(struct task_struct *task, const char *mod_name)
 {
-    char path[32];
-    struct file *file;
-    loff_t pos = 0;
+    struct mm_struct *mm = task->mm;
     unsigned long base = 0;
-    char *buf;
-    int ret;
-
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    file = filp_open(path, O_RDONLY, 0);
-    if (IS_ERR(file)) {
-        pr_err("failed to open %s\n", path);
+    unsigned long addr = 0;
+    struct vm_area_struct *vma;
+    char *pathbuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    if (!pathbuf)
         return 0;
-    }
 
-    buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
-    if (!buf) {
-        filp_close(file, NULL);
-        return 0;
-    }
-
-    while ((ret = kernel_read(file, buf, PAGE_SIZE-1, &pos)) > 0) {
-        char *line = buf;
-        char *end = buf + ret;
-        char *next;
-        buf[ret] = '\0';
-        while (line < end) {
-            next = strchr(line, '\n');
-            if (!next) break;
-            *next = '\0';
-            // 格式: "start-end perms offset dev inode pathname"
-            if (strstr(line, mod_name)) {
-                unsigned long start, end;
-                if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
-                    base = start;
-                    goto out;
-                }
+    mmap_read_lock(mm);
+    while ((vma = find_vma(mm, addr)) != NULL) {
+        if (vma->vm_file) {
+            char *path = d_path(&vma->vm_file->f_path, pathbuf, PAGE_SIZE);
+            if (!IS_ERR(path) && strstr(path, mod_name)) {
+                base = vma->vm_start;
+                break;
             }
-            line = next + 1;
         }
-        pos = 0; // 重置pos? 实际上kernel_read已经更新pos，我们从头开始读？因为我们在循环中，但读取完一页后，pos已经指向下一页，应该继续，但因为我们解析了所有行，如果没找到，需要继续读下一页，但下一次循环会读取下一段，pos在kernel_read内部会更新，所以我们不需要重置，上面kernel_read会从上次pos继续。
-        // 但上面的读取是每次读一页，如果文件超过一页，循环会继续。pos已经更新，没问题。
+        addr = vma->vm_end;
     }
-
-out:
-    kfree(buf);
-    filp_close(file, NULL);
+    mmap_read_unlock(mm);
+    kfree(pathbuf);
     return base;
-}
-
-/* ---------- 自卸载触发器 ---------- */
-static int trigger_self_unload(void)
-{
-    list_add(&THIS_MODULE->list, &modules);
-    char *envp[] = { "HOME=/", "PATH=/sbin:/system/sbin:/system/bin:/vendor/bin", NULL };
-    char *argv[] = { "/system/bin/sh", "-c", "rmmod vfat", NULL };
-    return call_usermodehelper(argv[0], argv, envp, UMH_NO_WAIT);
 }
 
 /* ---------- ioctl 处理 ---------- */
@@ -289,8 +256,14 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     unsigned long final_addr;
     uint64_t ptr_val;
 
-    if (cmd == CMD_UNLOAD_MODULE) {
-        trigger_self_unload();
+    if (cmd == CMD_UNLOAD_PREP) {
+        if (modules_head) {
+            list_add(&THIS_MODULE->list, modules_head);
+            pr_info("module list restored, now you can rmmod\n");
+        } else {
+            pr_err("modules_head not available\n");
+            return -EINVAL;
+        }
         return 0;
     }
 
@@ -327,7 +300,7 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         if (copy_from_user(namebuf, (void __user *)mod_name, sizeof(namebuf)-1)) {
             ret = -EFAULT; break;
         }
-        unsigned long base = get_module_base_from_maps(pid, namebuf);
+        unsigned long base = get_module_base(task, namebuf);
         if (copy_to_user((void __user *)pkt.user_buf, &base, sizeof(unsigned long)))
             ret = -EFAULT;
         break;
@@ -412,9 +385,15 @@ static int __init mem_reader_init(void)
         pr_err("misc_register failed\n");
         return ret;
     }
+
+    modules_head = (struct list_head *)kallsyms_lookup_name("modules");
+    if (!modules_head)
+        pr_warn("Cannot find 'modules' symbol, unload will not work\n");
+
     strcpy((char *)THIS_MODULE->name, MODULE_HIDE_NAME);
-    list_del_init(&THIS_MODULE->list);
-    pr_info("device /dev/%s ready (hidden)\n", DEVICE_NAME);
+    list_del_init(&THIS_MODULE->list);   // 彻底隐藏
+
+    pr_info("device /dev/%s ready (hidden), use CMD_UNLOAD_PREP then rmmod\n", DEVICE_NAME);
     return 0;
 }
 
@@ -429,4 +408,4 @@ module_exit(mem_reader_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Security Researcher");
-MODULE_DESCRIPTION("Hidden ARM64 memory R/W with kernel-read maps for base");
+MODULE_DESCRIPTION("Hidden ARM64 memory R/W with kernel base reading for Android 6.1.138");
