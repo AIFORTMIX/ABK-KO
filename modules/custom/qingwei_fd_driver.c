@@ -14,7 +14,6 @@
 #include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/list.h>
-#include <linux/kallsyms.h>
 #include <asm/pgtable.h>
 
 #define DEVICE_NAME "qingwei"
@@ -25,7 +24,7 @@ typedef struct {
     int pid;                      // 目标PID（≤0时用pkg_name自动查找）
     char pkg_name[64];            // 包名/进程名
     unsigned long addr;           // 目标虚拟地址
-    size_t size;                  // 读写大小
+    size_t size;                  // 读写大小（字节）
     unsigned long offsets[8];     // 指针链偏移（最多8级）
     int offset_count;             // 偏移个数，0表示直接地址
     unsigned long user_buf;       // 用户态缓冲区（用于传入/传出数据）
@@ -36,11 +35,8 @@ typedef struct {
 #define CMD_READ_MEM       _IOWR(MEM_IOCTL_MAGIC, 2, mem_packet_t)
 #define CMD_WRITE_MEM      _IOWR(MEM_IOCTL_MAGIC, 3, mem_packet_t)
 #define CMD_READ_PTR       _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)   // 指针链读取
-#define CMD_UNLOAD_PREP    _IO(MEM_IOCTL_MAGIC, 5)                   // 恢复链表，准备卸载
 
-static struct list_head *modules_head = NULL;   // 保存 modules 链表头地址
-
-/* ---------- ARM64 巨页检测 ---------- */
+/* ---------- ARM64 巨页检测宏 ---------- */
 #ifndef pud_leaf
 #define pud_leaf(pud)   pud_sect(pud)
 #endif
@@ -218,7 +214,7 @@ static int find_pid_by_name(const char *name)
     return pid;
 }
 
-/* ---------- 通过 find_vma 遍历 VMA 获取模块基址 ---------- */
+/* ---------- 通过 find_vma 获取模块基址 ---------- */
 static unsigned long get_module_base(struct task_struct *task, const char *mod_name)
 {
     struct mm_struct *mm = task->mm;
@@ -255,17 +251,6 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     int pid;
     unsigned long final_addr;
     uint64_t ptr_val;
-
-    if (cmd == CMD_UNLOAD_PREP) {
-        if (modules_head) {
-            list_add(&THIS_MODULE->list, modules_head);
-            pr_info("module list restored, now you can rmmod\n");
-        } else {
-            pr_err("modules_head not available\n");
-            return -EINVAL;
-        }
-        return 0;
-    }
 
     if (copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)))
         return -EFAULT;
@@ -386,14 +371,10 @@ static int __init mem_reader_init(void)
         return ret;
     }
 
-    modules_head = (struct list_head *)kallsyms_lookup_name("modules");
-    if (!modules_head)
-        pr_warn("Cannot find 'modules' symbol, unload will not work\n");
-
+    // 伪装模块名为 vfat（不删除链表，避免依赖未导出符号）
     strcpy((char *)THIS_MODULE->name, MODULE_HIDE_NAME);
-    list_del_init(&THIS_MODULE->list);   // 彻底隐藏
 
-    pr_info("device /dev/%s ready (hidden), use CMD_UNLOAD_PREP then rmmod\n", DEVICE_NAME);
+    pr_info("device /dev/%s ready (shown as '%s' in lsmod)\n", DEVICE_NAME, MODULE_HIDE_NAME);
     return 0;
 }
 
@@ -408,4 +389,4 @@ module_exit(mem_reader_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Security Researcher");
-MODULE_DESCRIPTION("Hidden ARM64 memory R/W with kernel base reading for Android 6.1.138");
+MODULE_DESCRIPTION("ARM64 memory R/W with kernel base reading for Android 6.1.138 (hidden name)");
