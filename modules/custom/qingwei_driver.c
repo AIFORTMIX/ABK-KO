@@ -1,6 +1,5 @@
 // ============================================================================
-// qingwei_driver.c - 最终稳定版（放宽 mmap 大小限制）
-// 支持任意 ≤ 分配大小的 mmap 长度
+// qingwei_driver.c - 最终版（支持按库名获取基址）
 // ============================================================================
 
 #include <linux/module.h>
@@ -30,8 +29,8 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
-MODULE_DESCRIPTION("qingwei mmap fixed driver (relaxed size)");
-MODULE_VERSION("3.8");
+MODULE_DESCRIPTION("qingwei driver with module base lookup");
+MODULE_VERSION("4.0");
 
 // ============================================================================
 // 协议定义
@@ -42,8 +41,9 @@ enum sm_req_op {
     OP_NULL = 0,
     OP_READ,
     OP_WRITE,
-    OP_MEM_ENUM,
+    OP_MEM_ENUM,                // 保留但不再使用
     OP_KEXIT,
+    OP_GET_MODULE_BASE,         // 新增：获取指定库基址
 };
 
 struct mem_region {
@@ -70,11 +70,11 @@ struct req_obj {
     volatile bool kernel;
     volatile bool user;
     enum sm_req_op op;
-    long status;
+    long status;                // 返回状态（0成功，负值错误）
     int pid;
-    unsigned long target_addr;
+    unsigned long target_addr;  // 输出：基址（用于 OP_GET_MODULE_BASE）
     size_t size;
-    unsigned char user_buffer[USER_BUF_SIZE];
+    unsigned char user_buffer[USER_BUF_SIZE]; // 输入：库名字符串
     struct memory_info mem_info;
 };
 
@@ -195,63 +195,63 @@ static ssize_t write_process_memory(int pid, unsigned long vaddr, const void *bu
 }
 
 // ============================================================================
-// 进程内存布局枚举
+// 根据库名获取基址
 // ============================================================================
-static int virtual_memory_enum(int pid, struct memory_info *info) {
+static unsigned long get_module_base(int pid, const char *name) {
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
-    int mod_count = 0, reg_count = 0;
+    unsigned long base = 0;
+    char *path = NULL;
+    char *buf = NULL;
 
     rcu_read_lock();
     task = find_task_by_vpid(pid);
-    if (!task) { rcu_read_unlock(); return -ESRCH; }
+    if (!task) { rcu_read_unlock(); return 0; }
     get_task_struct(task);
     rcu_read_unlock();
 
     mm = get_task_mm(task);
-    if (!mm) { put_task_struct(task); return -ESRCH; }
+    if (!mm) { put_task_struct(task); return 0; }
 
-    memset(info, 0, sizeof(*info));
-    down_read(&mm->mmap_lock);
-    unsigned long start = 0;
-    while ((vma = find_vma(mm, start)) != NULL && mod_count < 32) {
-        char *path = NULL;
-        if (vma->vm_file && vma->vm_file->f_path.dentry) {
-            char *buf = (char*)__get_free_page(GFP_KERNEL);
-            if (buf) {
-                path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-                if (IS_ERR(path)) path = NULL;
-            }
-        }
-        if (path) {
-            if (strncmp(path, "/data/", 6) == 0 || strncmp(path, "/dev/", 5) == 0) {
-                struct module_info *mod = &info->modules[mod_count];
-                char *fname = strrchr(path, '/');
-                snprintf(mod->name, sizeof(mod->name), "%s", fname ? fname+1 : path);
-                mod->segs[0].start = vma->vm_start;
-                mod->segs[0].end = vma->vm_end;
-                mod->segs[0].prot = vma->vm_flags;
-                mod->seg_count = 1;
-                mod_count++;
-            }
-            free_page((unsigned long)path);
-        }
-        if ((vma->vm_flags & VM_READ) && (vma->vm_flags & VM_WRITE) &&
-            !(vma->vm_flags & VM_SHARED) && reg_count < 64) {
-            info->regions[reg_count].start = vma->vm_start;
-            info->regions[reg_count].end = vma->vm_end;
-            info->regions[reg_count].prot = vma->vm_flags;
-            reg_count++;
-        }
-        start = vma->vm_end;
+    if (!down_read_trylock(&mm->mmap_lock)) {
+        pr_err("qingwei: cannot acquire mmap_lock for pid %d\n", pid);
+        mmput(mm);
+        put_task_struct(task);
+        return 0;
     }
+
+    buf = (char*)__get_free_page(GFP_KERNEL);
+    if (!buf) {
+        up_read(&mm->mmap_lock);
+        mmput(mm);
+        put_task_struct(task);
+        return 0;
+    }
+
+    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+        if (!vma->vm_file || !vma->vm_file->f_path.dentry)
+            continue;
+        path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+        if (IS_ERR(path))
+            continue;
+        // 检查路径是否包含库名
+        if (strstr(path, name)) {
+            base = vma->vm_start;
+            break;
+        }
+    }
+
+    free_page((unsigned long)buf);
     up_read(&mm->mmap_lock);
-    info->module_count = mod_count;
-    info->region_count = reg_count;
     mmput(mm);
     put_task_struct(task);
-    return 0;
+
+    if (base)
+        pr_info("qingwei: found %s at 0x%lx\n", name, base);
+    else
+        pr_info("qingwei: %s not found in pid %d\n", name, pid);
+    return base;
 }
 
 // ============================================================================
@@ -279,9 +279,23 @@ static int dispatch_thread_func(void *data) {
                                            g_req->user_buffer, g_req->size);
                 g_req->status = ret;
                 break;
+            case OP_GET_MODULE_BASE: {
+                // user_buffer 存放库名，以 '\0' 结尾
+                char *name = (char*)g_req->user_buffer;
+                name[USER_BUF_SIZE - 1] = '\0';
+                unsigned long base = get_module_base(g_req->pid, name);
+                if (base) {
+                    g_req->target_addr = base;
+                    g_req->status = 0;
+                } else {
+                    g_req->target_addr = 0;
+                    g_req->status = -ENOENT;
+                }
+                break;
+            }
             case OP_MEM_ENUM:
-                ret = virtual_memory_enum(g_req->pid, &g_req->mem_info);
-                g_req->status = ret;
+                // 保留但不再使用，可简单返回错误
+                g_req->status = -ENOSYS;
                 break;
             case OP_KEXIT:
                 g_req->status = 0;
@@ -300,7 +314,7 @@ static int dispatch_thread_func(void *data) {
 }
 
 // ============================================================================
-// mmap 操作：仅限制大小不超过分配的总内存
+// mmap 操作
 // ============================================================================
 static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long size = vma->vm_end - vma->vm_start;
@@ -317,14 +331,12 @@ static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
         return -EINVAL;
     }
 
-    // 计算需要映射的页数
     unsigned int num_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
     if (num_pages > g_num_pages) {
         pr_err("qingwei: requested pages %u > allocated %u\n", num_pages, g_num_pages);
         return -EINVAL;
     }
 
-    // 循环映射每一页
     for (i = 0; i < num_pages; i++) {
         page = nth_page(g_pages, i);
         pfn = page_to_pfn(page);
@@ -340,9 +352,6 @@ static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
     return 0;
 }
 
-// ============================================================================
-// 设备文件操作
-// ============================================================================
 static struct file_operations qingwei_fops = {
     .owner = THIS_MODULE,
     .mmap  = qingwei_mmap,
@@ -359,7 +368,6 @@ static int __init qingwei_init(void) {
 
     hide_module();
 
-    // 分配连续物理内存
     g_pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
     if (!g_pages) {
         pr_err("qingwei: alloc_pages failed\n");
@@ -377,7 +385,6 @@ static int __init qingwei_init(void) {
     pr_info("qingwei: allocated %u pages (%u bytes) at %p\n",
             g_num_pages, g_allocated_size, g_req);
 
-    // 创建字符设备
     if (alloc_chrdev_region(&dev, 0, 1, "qingwei") < 0) {
         pr_err("qingwei: alloc_chrdev_region failed\n");
         goto err_free_pages;
@@ -407,7 +414,6 @@ static int __init qingwei_init(void) {
         goto err_free_pages;
     }
 
-    // 启动分发线程
     g_dispatch_thread = kthread_run(dispatch_thread_func, NULL, "qingwei_disp");
     if (IS_ERR(g_dispatch_thread)) {
         pr_err("qingwei: dispatch thread failed\n");
