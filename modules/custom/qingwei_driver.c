@@ -1,5 +1,6 @@
 // ============================================================================
-// qingwei_v4.2.c - 基于 4.1，增加 OP_GET_PID（不依赖 /proc）
+// qingwei_v4.2_fixed.c - 修正 FOLL_READ 未定义错误
+// 基于 4.1，增加 OP_GET_PID（不依赖 /proc）
 // 适用于 Linux 6.1 / Android 14
 // ============================================================================
 
@@ -31,7 +32,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
 MODULE_DESCRIPTION("qingwei driver (base lookup + PID lookup)");
-MODULE_VERSION("4.2");
+MODULE_VERSION("4.2-fixed");
 
 #define USER_BUF_SIZE 0x1000
 
@@ -42,7 +43,7 @@ enum sm_req_op {
     OP_MEM_ENUM,
     OP_KEXIT,
     OP_GET_MODULE_BASE,
-    OP_GET_PID,                 // 新增：按包名获取 PID
+    OP_GET_PID,
 };
 
 struct req_obj {
@@ -50,10 +51,10 @@ struct req_obj {
     volatile bool user;
     enum sm_req_op op;
     long status;
-    int pid;                     // 输出 PID（OP_GET_PID）
-    unsigned long target_addr;   // 输出基址（OP_GET_MODULE_BASE）
+    int pid;
+    unsigned long target_addr;
     size_t size;
-    unsigned char user_buffer[USER_BUF_SIZE]; // 输入：包名或库名
+    unsigned char user_buffer[USER_BUF_SIZE];
 };
 
 static struct req_obj *g_req = NULL;
@@ -152,7 +153,8 @@ static ssize_t write_process_memory(int pid, unsigned long vaddr, const void *bu
 }
 
 // ------------------------------------------------------------------
-// 按包名查找 PID（直接读取进程的 cmdline 而不经过 /proc）
+// 按包名查找 PID（直接读取进程的 cmdline，不经过 /proc）
+// 使用 access_remote_vm，FOLL_READ 用 0 代替
 // ------------------------------------------------------------------
 static int get_pid_by_package_name(const char *pkg_name) {
     struct task_struct *task;
@@ -174,8 +176,8 @@ static int get_pid_by_package_name(const char *pkg_name) {
         if (!mm)
             continue;
 
-        // 读取进程的 cmdline（用户空间地址 mm->arg_start）
-        ret = access_remote_vm(mm, mm->arg_start, cmdline_buf, USER_BUF_SIZE - 1, FOLL_READ);
+        // 读取进程的 cmdline，FOLL_READ 值实际为 0，直接使用 0 避免未定义
+        ret = access_remote_vm(mm, mm->arg_start, cmdline_buf, USER_BUF_SIZE - 1, 0);
         mmput(mm);
 
         if (ret <= 0)
