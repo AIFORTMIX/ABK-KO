@@ -1,5 +1,5 @@
 // ============================================================================
-// qingwei_driver.c - 最终稳定版（按库名查找基址，无枚举）
+// qingwei_v4.2.c - 基于 4.1，增加 OP_GET_PID（不依赖 /proc）
 // 适用于 Linux 6.1 / Android 14
 // ============================================================================
 
@@ -30,13 +30,10 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
-MODULE_DESCRIPTION("qingwei driver with module base lookup (vm_next fixed)");
-MODULE_VERSION("4.1");
+MODULE_DESCRIPTION("qingwei driver (base lookup + PID lookup)");
+MODULE_VERSION("4.2");
 
-// ============================================================================
-// 协议定义
-// ============================================================================
-#define USER_BUF_SIZE    0x1000
+#define USER_BUF_SIZE 0x1000
 
 enum sm_req_op {
     OP_NULL = 0,
@@ -45,26 +42,7 @@ enum sm_req_op {
     OP_MEM_ENUM,
     OP_KEXIT,
     OP_GET_MODULE_BASE,
-};
-
-struct mem_region {
-    unsigned long start;
-    unsigned long end;
-    unsigned int prot;
-    int index;
-};
-
-struct module_info {
-    char name[64];
-    int seg_count;
-    struct mem_region segs[16];
-};
-
-struct memory_info {
-    int module_count;
-    struct module_info modules[32];
-    int region_count;
-    struct mem_region regions[64];
+    OP_GET_PID,                 // 新增：按包名获取 PID
 };
 
 struct req_obj {
@@ -72,16 +50,12 @@ struct req_obj {
     volatile bool user;
     enum sm_req_op op;
     long status;
-    int pid;
-    unsigned long target_addr;
+    int pid;                     // 输出 PID（OP_GET_PID）
+    unsigned long target_addr;   // 输出基址（OP_GET_MODULE_BASE）
     size_t size;
-    unsigned char user_buffer[USER_BUF_SIZE];
-    struct memory_info mem_info;
+    unsigned char user_buffer[USER_BUF_SIZE]; // 输入：包名或库名
 };
 
-// ============================================================================
-// 全局变量
-// ============================================================================
 static struct req_obj *g_req = NULL;
 static struct page *g_pages = NULL;
 static unsigned int g_num_pages = 0;
@@ -94,20 +68,11 @@ static struct class *qingwei_class = NULL;
 static struct device *qingwei_device = NULL;
 static struct cdev qingwei_cdev;
 
-// ============================================================================
-// 模块隐藏
-// ============================================================================
 static void hide_module(void) {
     struct kobject *kobj = &THIS_MODULE->mkobj.kobj;
-    if (kobj) {
-        kobject_del(kobj);
-        pr_info("qingwei: module hidden\n");
-    }
+    if (kobj) kobject_del(kobj);
 }
 
-// ============================================================================
-// 内存地址翻译
-// ============================================================================
 static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va, unsigned long *pa) {
     pgd_t *pgd = pgd_offset(mm, va);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) return -EFAULT;
@@ -123,24 +88,18 @@ static int mmu_translate_va_to_pa(struct mm_struct *mm, unsigned long va, unsign
     return 0;
 }
 
-// ============================================================================
-// 进程内存读写
-// ============================================================================
 static ssize_t read_process_memory(int pid, unsigned long vaddr, void *buf, size_t size) {
     struct task_struct *task;
     struct mm_struct *mm;
     size_t done = 0;
     int ret;
-
     rcu_read_lock();
     task = find_task_by_vpid(pid);
     if (!task) { rcu_read_unlock(); return -ESRCH; }
     get_task_struct(task);
     rcu_read_unlock();
-
     mm = get_task_mm(task);
     if (!mm) { put_task_struct(task); return -ESRCH; }
-
     down_read(&mm->mmap_lock);
     while (done < size) {
         unsigned long pa;
@@ -167,16 +126,13 @@ static ssize_t write_process_memory(int pid, unsigned long vaddr, const void *bu
     struct mm_struct *mm;
     size_t done = 0;
     int ret;
-
     rcu_read_lock();
     task = find_task_by_vpid(pid);
     if (!task) { rcu_read_unlock(); return -ESRCH; }
     get_task_struct(task);
     rcu_read_unlock();
-
     mm = get_task_mm(task);
     if (!mm) { put_task_struct(task); return -ESRCH; }
-
     down_read(&mm->mmap_lock);
     while (done < size) {
         unsigned long pa;
@@ -195,9 +151,55 @@ static ssize_t write_process_memory(int pid, unsigned long vaddr, const void *bu
     return done;
 }
 
-// ============================================================================
-// 根据库名获取基址（使用 find_vma，无 vm_next）
-// ============================================================================
+// ------------------------------------------------------------------
+// 按包名查找 PID（直接读取进程的 cmdline 而不经过 /proc）
+// ------------------------------------------------------------------
+static int get_pid_by_package_name(const char *pkg_name) {
+    struct task_struct *task;
+    struct mm_struct *mm;
+    char *cmdline_buf;
+    int pid = -ESRCH;
+    int ret;
+
+    if (!pkg_name)
+        return -EINVAL;
+
+    cmdline_buf = kmalloc(USER_BUF_SIZE, GFP_KERNEL);
+    if (!cmdline_buf)
+        return -ENOMEM;
+
+    rcu_read_lock();
+    for_each_process(task) {
+        mm = get_task_mm(task);
+        if (!mm)
+            continue;
+
+        // 读取进程的 cmdline（用户空间地址 mm->arg_start）
+        ret = access_remote_vm(mm, mm->arg_start, cmdline_buf, USER_BUF_SIZE - 1, FOLL_READ);
+        mmput(mm);
+
+        if (ret <= 0)
+            continue;
+
+        cmdline_buf[ret] = '\0';
+        // 检查第一个参数是否完全等于包名（以 '\0' 或空格结尾）
+        int len = strlen(pkg_name);
+        if (strlen(cmdline_buf) >= len && strncmp(cmdline_buf, pkg_name, len) == 0) {
+            if (cmdline_buf[len] == '\0' || cmdline_buf[len] == ' ') {
+                pid = task->pid;
+                break;
+            }
+        }
+    }
+    rcu_read_unlock();
+
+    kfree(cmdline_buf);
+    return pid;
+}
+
+// ------------------------------------------------------------------
+// 按库名获取基址（同 4.1，保持不变）
+// ------------------------------------------------------------------
 static unsigned long get_module_base(int pid, const char *name) {
     struct task_struct *task;
     struct mm_struct *mm;
@@ -206,23 +208,18 @@ static unsigned long get_module_base(int pid, const char *name) {
     char *path = NULL;
     char *buf = NULL;
     unsigned long start = 0;
-
     rcu_read_lock();
     task = find_task_by_vpid(pid);
     if (!task) { rcu_read_unlock(); return 0; }
     get_task_struct(task);
     rcu_read_unlock();
-
     mm = get_task_mm(task);
     if (!mm) { put_task_struct(task); return 0; }
-
     if (!down_read_trylock(&mm->mmap_lock)) {
-        pr_err("qingwei: cannot acquire mmap_lock for pid %d\n", pid);
         mmput(mm);
         put_task_struct(task);
         return 0;
     }
-
     buf = (char*)__get_free_page(GFP_KERNEL);
     if (!buf) {
         up_read(&mm->mmap_lock);
@@ -230,7 +227,6 @@ static unsigned long get_module_base(int pid, const char *name) {
         put_task_struct(task);
         return 0;
     }
-
     while ((vma = find_vma(mm, start)) != NULL) {
         if (vma->vm_file && vma->vm_file->f_path.dentry) {
             path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
@@ -243,33 +239,25 @@ static unsigned long get_module_base(int pid, const char *name) {
         }
         start = vma->vm_end;
     }
-
     free_page((unsigned long)buf);
     up_read(&mm->mmap_lock);
     mmput(mm);
     put_task_struct(task);
-
-    if (base)
-        pr_info("qingwei: found %s at 0x%lx\n", name, base);
-    else
-        pr_info("qingwei: %s not found in pid %d\n", name, pid);
     return base;
 }
 
-// ============================================================================
-// 请求分发线程
-// ============================================================================
+// ------------------------------------------------------------------
+// 分发线程（新增 OP_GET_PID 处理）
+// ------------------------------------------------------------------
 static int dispatch_thread_func(void *data) {
     int ret;
     pr_info("qingwei: dispatch_thread started\n");
     while (!kthread_should_stop() && !g_exiting) {
         if (!g_req) { msleep(100); continue; }
         if (!g_req->kernel) { usleep_range(50,100); continue; }
-
         unsigned long flags;
         local_irq_save(flags);
         g_req->kernel = false;
-
         switch (g_req->op) {
             case OP_READ:
                 ret = read_process_memory(g_req->pid, g_req->target_addr,
@@ -294,9 +282,19 @@ static int dispatch_thread_func(void *data) {
                 }
                 break;
             }
-            case OP_MEM_ENUM:
-                g_req->status = -ENOSYS;
+            case OP_GET_PID: {
+                char *pkg = (char*)g_req->user_buffer;
+                pkg[USER_BUF_SIZE - 1] = '\0';
+                int pid = get_pid_by_package_name(pkg);
+                if (pid > 0) {
+                    g_req->pid = pid;
+                    g_req->status = 0;
+                } else {
+                    g_req->pid = -1;
+                    g_req->status = pid; // 负错误码
+                }
                 break;
+            }
             case OP_KEXIT:
                 g_req->status = 0;
                 g_req->user = true;
@@ -313,9 +311,9 @@ static int dispatch_thread_func(void *data) {
     return 0;
 }
 
-// ============================================================================
-// mmap 操作
-// ============================================================================
+// ------------------------------------------------------------------
+// mmap 操作（与 4.1 相同）
+// ------------------------------------------------------------------
 static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long size = vma->vm_end - vma->vm_start;
     unsigned long pfn;
@@ -323,32 +321,16 @@ static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long addr;
     int err;
     int i;
-
-    pr_info("qingwei: mmap called, size=%lu, allocated_size=%u\n", size, g_allocated_size);
-
-    if (size > g_allocated_size) {
-        pr_err("qingwei: mmap size too large: %lu > %u\n", size, g_allocated_size);
-        return -EINVAL;
-    }
-
+    if (size > g_allocated_size) return -EINVAL;
     unsigned int num_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-    if (num_pages > g_num_pages) {
-        pr_err("qingwei: requested pages %u > allocated %u\n", num_pages, g_num_pages);
-        return -EINVAL;
-    }
-
+    if (num_pages > g_num_pages) return -EINVAL;
     for (i = 0; i < num_pages; i++) {
         page = nth_page(g_pages, i);
         pfn = page_to_pfn(page);
         addr = vma->vm_start + i * PAGE_SIZE;
         err = remap_pfn_range(vma, addr, pfn, PAGE_SIZE, vma->vm_page_prot);
-        if (err) {
-            pr_err("qingwei: remap_pfn_range failed at page %d with %d\n", i, err);
-            return err;
-        }
+        if (err) return err;
     }
-
-    pr_info("qingwei: mmap success, %u pages mapped\n", num_pages);
     return 0;
 }
 
@@ -357,112 +339,52 @@ static struct file_operations qingwei_fops = {
     .mmap  = qingwei_mmap,
 };
 
-// ============================================================================
-// 初始化与退出
-// ============================================================================
+// ------------------------------------------------------------------
+// 初始化与退出（同 4.1）
+// ------------------------------------------------------------------
 static int __init qingwei_init(void) {
     dev_t dev;
     int ret;
     unsigned int req_size = sizeof(struct req_obj);
     unsigned int order = get_order(req_size);
-
     hide_module();
-
     g_pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
-    if (!g_pages) {
-        pr_err("qingwei: alloc_pages failed\n");
-        return -ENOMEM;
-    }
+    if (!g_pages) return -ENOMEM;
     g_num_pages = (1 << order);
     g_allocated_size = g_num_pages * PAGE_SIZE;
     g_req = page_address(g_pages);
-    if (!g_req) {
-        pr_err("qingwei: page_address failed\n");
-        __free_pages(g_pages, order);
-        return -ENOMEM;
-    }
-
-    pr_info("qingwei: allocated %u pages (%u bytes) at %p\n",
-            g_num_pages, g_allocated_size, g_req);
-
-    if (alloc_chrdev_region(&dev, 0, 1, "qingwei") < 0) {
-        pr_err("qingwei: alloc_chrdev_region failed\n");
-        goto err_free_pages;
-    }
+    if (!g_req) { __free_pages(g_pages, order); return -ENOMEM; }
+    pr_info("qingwei: allocated %u pages at %p\n", g_num_pages, g_req);
+    if (alloc_chrdev_region(&dev, 0, 1, "qingwei") < 0) goto err;
     major = MAJOR(dev);
     cdev_init(&qingwei_cdev, &qingwei_fops);
     qingwei_cdev.owner = THIS_MODULE;
     ret = cdev_add(&qingwei_cdev, dev, 1);
-    if (ret < 0) {
-        pr_err("qingwei: cdev_add failed with %d\n", ret);
-        unregister_chrdev_region(dev, 1);
-        goto err_free_pages;
-    }
+    if (ret < 0) { unregister_chrdev_region(dev, 1); goto err; }
     qingwei_class = class_create(THIS_MODULE, "qingwei_class");
-    if (IS_ERR(qingwei_class)) {
-        pr_err("qingwei: class_create failed\n");
-        cdev_del(&qingwei_cdev);
-        unregister_chrdev_region(dev, 1);
-        goto err_free_pages;
-    }
+    if (IS_ERR(qingwei_class)) { cdev_del(&qingwei_cdev); unregister_chrdev_region(dev, 1); goto err; }
     qingwei_device = device_create(qingwei_class, NULL, dev, NULL, "qingwei");
-    if (IS_ERR(qingwei_device)) {
-        pr_err("qingwei: device_create failed\n");
-        class_destroy(qingwei_class);
-        cdev_del(&qingwei_cdev);
-        unregister_chrdev_region(dev, 1);
-        goto err_free_pages;
-    }
-
+    if (IS_ERR(qingwei_device)) { class_destroy(qingwei_class); cdev_del(&qingwei_cdev); unregister_chrdev_region(dev, 1); goto err; }
     g_dispatch_thread = kthread_run(dispatch_thread_func, NULL, "qingwei_disp");
-    if (IS_ERR(g_dispatch_thread)) {
-        pr_err("qingwei: dispatch thread failed\n");
-        device_destroy(qingwei_class, dev);
-        class_destroy(qingwei_class);
-        cdev_del(&qingwei_cdev);
-        unregister_chrdev_region(dev, 1);
-        goto err_free_pages;
-    }
-
+    if (IS_ERR(g_dispatch_thread)) { device_destroy(qingwei_class, dev); class_destroy(qingwei_class); cdev_del(&qingwei_cdev); unregister_chrdev_region(dev, 1); goto err; }
     pr_info("qingwei: loaded successfully\n");
     return 0;
-
-err_free_pages:
-    if (g_pages) {
-        __free_pages(g_pages, order);
-        g_pages = NULL;
-        g_req = NULL;
-    }
+err:
+    if (g_pages) { __free_pages(g_pages, order); g_pages = NULL; g_req = NULL; }
     return -1;
 }
 
 static void __exit qingwei_exit(void) {
     dev_t dev = MKDEV(major, 0);
     unsigned int order = get_order(sizeof(struct req_obj));
-
-    pr_info("qingwei: exiting...\n");
     g_exiting = true;
-
-    if (g_req) {
-        g_req->op = OP_KEXIT;
-        g_req->kernel = true;
-        g_req->user = false;
-        msleep(100);
-    }
-
+    if (g_req) { g_req->op = OP_KEXIT; g_req->kernel = true; g_req->user = false; msleep(100); }
     if (g_dispatch_thread) kthread_stop(g_dispatch_thread);
-
     device_destroy(qingwei_class, dev);
     class_destroy(qingwei_class);
     cdev_del(&qingwei_cdev);
     unregister_chrdev_region(dev, 1);
-
-    if (g_pages) {
-        __free_pages(g_pages, order);
-        g_pages = NULL;
-        g_req = NULL;
-    }
-
+    if (g_pages) { __free_pages(g_pages, order); g_pages = NULL; g_req = NULL; }
     pr_info("qingwei: unloaded\n");
 }
 
