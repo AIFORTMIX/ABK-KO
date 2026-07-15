@@ -1,7 +1,7 @@
 // ============================================================================
 // qingwei_basic.c - 精简稳定版（仅内存读写 + 枚举）
 // 使用 vmalloc + mmap 共享内存，无断点/触摸
-// 适用于 Linux 6.1 / Android 14（已修复所有警告）
+// 适用于 Linux 6.1 / Android 14（无文件日志，使用 printk）
 // ============================================================================
 
 #include <linux/module.h>
@@ -25,16 +25,13 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
-#include <linux/file.h>
-#include <linux/fcntl.h>
-#include <linux/namei.h>
 #include <asm/ptrace.h>
 #include <asm/barrier.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
 MODULE_DESCRIPTION("qingwei basic memory driver (no BP/touch)");
-MODULE_VERSION("3.4");
+MODULE_VERSION("3.5");
 
 // ============================================================================
 // 协议定义
@@ -92,30 +89,6 @@ static int major;
 static struct class *qingwei_class = NULL;
 static struct device *qingwei_device = NULL;
 static struct cdev qingwei_cdev;
-
-// ============================================================================
-// 文件日志（使用 kernel_write）
-// ============================================================================
-static void write_kmsg_log(const char *msg) {
-    struct file *filp = NULL;
-    loff_t pos = 0;
-    char *path = "/data/local/tmp/kmsg.txt";
-    int ret;
-
-    filp = filp_open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (IS_ERR(filp)) {
-        pr_err("qingwei: failed to open log file\n");
-        return;
-    }
-
-    pos = vfs_llseek(filp, 0, SEEK_END);
-    ret = kernel_write(filp, msg, strlen(msg), &pos);
-    if (ret < 0)
-        pr_err("qingwei: kernel_write failed %d\n", ret);
-
-    vfs_fsync(filp, 0);
-    filp_close(filp, NULL);
-}
 
 // ============================================================================
 // 模块隐藏
@@ -283,7 +256,7 @@ static int virtual_memory_enum(int pid, struct memory_info *info) {
 // ============================================================================
 static int dispatch_thread_func(void *data) {
     int ret;
-    write_kmsg_log("dispatch_thread: started\n");
+    pr_info("qingwei: dispatch_thread started\n");
     while (!kthread_should_stop() && !g_exiting) {
         if (!g_req) { msleep(100); continue; }
         if (!g_req->kernel) { usleep_range(50,100); continue; }
@@ -311,7 +284,7 @@ static int dispatch_thread_func(void *data) {
                 g_req->status = 0;
                 g_req->user = true;
                 local_irq_restore(flags);
-                write_kmsg_log("dispatch_thread: received KEXIT\n");
+                pr_info("qingwei: dispatch_thread received KEXIT\n");
                 return 0;
             default:
                 g_req->status = -EINVAL;
@@ -319,7 +292,7 @@ static int dispatch_thread_func(void *data) {
         g_req->user = true;
         local_irq_restore(flags);
     }
-    write_kmsg_log("dispatch_thread: exiting\n");
+    pr_info("qingwei: dispatch_thread exiting\n");
     return 0;
 }
 
@@ -362,7 +335,7 @@ static struct file_operations qingwei_fops = {
 // ============================================================================
 static int __init qingwei_init(void) {
     dev_t dev;
-    char buf[128];
+    int ret;
 
     hide_module();
 
@@ -374,9 +347,7 @@ static int __init qingwei_init(void) {
     }
     memset(g_req, 0, sizeof(struct req_obj));
 
-    snprintf(buf, sizeof(buf), "vmalloc addr: 0x%p\n", g_req);
-    write_kmsg_log("=== qingwei_init ===\n");
-    write_kmsg_log(buf);
+    pr_info("qingwei: vmalloc addr: 0x%p\n", g_req);
 
     // 创建字符设备
     if (alloc_chrdev_region(&dev, 0, 1, "qingwei") < 0) {
@@ -386,8 +357,9 @@ static int __init qingwei_init(void) {
     major = MAJOR(dev);
     cdev_init(&qingwei_cdev, &qingwei_fops);
     qingwei_cdev.owner = THIS_MODULE;
-    if (cdev_add(&qingwei_cdev, dev, 1) < 0) {
-        pr_err("qingwei: cdev_add failed\n");
+    ret = cdev_add(&qingwei_cdev, dev, 1);
+    if (ret < 0) {
+        pr_err("qingwei: cdev_add failed with %d\n", ret);
         unregister_chrdev_region(dev, 1);
         goto err_vfree;
     }
@@ -419,7 +391,6 @@ static int __init qingwei_init(void) {
     }
 
     pr_info("qingwei: loaded successfully (vmalloc addr=%p)\n", g_req);
-    write_kmsg_log("qingwei: loaded successfully\n");
     return 0;
 
 err_vfree:
@@ -431,7 +402,7 @@ err_vfree:
 static void __exit qingwei_exit(void) {
     dev_t dev = MKDEV(major, 0);
 
-    write_kmsg_log("qingwei: exiting...\n");
+    pr_info("qingwei: exiting...\n");
     g_exiting = true;
 
     if (g_req) {
@@ -453,7 +424,6 @@ static void __exit qingwei_exit(void) {
         g_req = NULL;
     }
 
-    write_kmsg_log("qingwei: unloaded\n");
     pr_info("qingwei: unloaded\n");
 }
 
