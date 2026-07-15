@@ -185,7 +185,7 @@ static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
 }
 
 /* ---------- 按包名查找 PID ---------- */
-/* ---------- 改进的按包名查找 PID ---------- */
+/* ---------- 改进的按包名查找 PID ---------- */;
 static int find_pid_by_name(const char *name)
 {
     struct task_struct *task;
@@ -199,24 +199,30 @@ static int find_pid_by_name(const char *name)
     for_each_process(task) {
         int matched = 0;
 
-        // 1. 检查 comm 是否在 name 中（因为 comm 较短，通常为包名的前缀）
-        if (strstr(name, task->comm)) {
-            matched = 1;
-            pr_info("  comm '%s' matched\n", task->comm);
-        }
-
-        // 2. 如果 comm 匹配失败，再尝试完整命令行
-        if (!matched && task->mm && task->mm->arg_start) {
-            char buf[256] = {0};
+        // 1. 先尝试通过 cmdline (arg_start) 匹配包名
+        if (task->mm && task->mm->arg_start) {
+            char buf[512] = {0};
             size_t len = min_t(size_t, sizeof(buf)-1,
                                task->mm->arg_end - task->mm->arg_start);
             if (len > 0) {
-                if (strncpy_from_user(buf, (char __user *)task->mm->arg_start, len) > 0) {
+                long ret = strncpy_from_user(buf, (char __user *)task->mm->arg_start, len);
+                if (ret > 0) {
+                    buf[ret] = '\0';
                     if (strstr(buf, name)) {
                         matched = 1;
-                        pr_info("  cmdline '%s' matched\n", buf);
+                        pr_info("  cmdline matched: '%s'\n", buf);
                     }
+                } else {
+                    pr_info("  strncpy_from_user failed for pid %d, ret=%ld\n", task->pid, ret);
                 }
+            }
+        }
+
+        // 2. 如果 cmdline 匹配失败，再尝试 comm（仅作为备用）
+        if (!matched) {
+            if (strstr(name, task->comm) || strstr(task->comm, name)) {
+                matched = 1;
+                pr_info("  comm '%s' matched (fallback)\n", task->comm);
             }
         }
 
@@ -226,11 +232,17 @@ static int find_pid_by_name(const char *name)
             break;
         }
     }
+
+    if (pid < 0) {
+        pr_info("  No process found, listing first 10 comms:\n");
+        int count = 0;
+        for_each_process(task) {
+            if (count++ < 10)
+                pr_info("    comm: '%s'  pid: %d\n", task->comm, task->pid);
+        }
+    }
+
     rcu_read_unlock();
-
-    if (pid < 0)
-        pr_info("  No process found for '%s'\n", name);
-
     return pid;
 }
 
