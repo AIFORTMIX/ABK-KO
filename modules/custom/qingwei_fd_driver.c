@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-#define pr_fmt(fmt) "qingwei: " fmt
+#define pr_fmt(fmt) "qingwei_fd: " fmt
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -16,7 +16,7 @@
 #include <linux/list.h>
 #include <asm/pgtable.h>
 
-#define DEVICE_NAME "qingwei"
+#define DEVICE_NAME "qingwei_fd"
 #define MODULE_HIDE_NAME "vfat"
 
 /* ---------- 用户态接口 ---------- */
@@ -193,12 +193,20 @@ static int find_pid_by_name(const char *name)
     if (!name || !*name)
         return -EINVAL;
 
+    pr_info("find_pid_by_name: searching for '%s'\n", name);
+
     rcu_read_lock();
     for_each_process(task) {
         int matched = 0;
 
-        // 1. 检查完整命令行（arg_start）
-        if (task->mm && task->mm->arg_start) {
+        // 1. 检查 comm 是否在 name 中（因为 comm 较短，通常为包名的前缀）
+        if (strstr(name, task->comm)) {
+            matched = 1;
+            pr_info("  comm '%s' matched\n", task->comm);
+        }
+
+        // 2. 如果 comm 匹配失败，再尝试完整命令行
+        if (!matched && task->mm && task->mm->arg_start) {
             char buf[256] = {0};
             size_t len = min_t(size_t, sizeof(buf)-1,
                                task->mm->arg_end - task->mm->arg_start);
@@ -206,25 +214,23 @@ static int find_pid_by_name(const char *name)
                 if (strncpy_from_user(buf, (char __user *)task->mm->arg_start, len) > 0) {
                     if (strstr(buf, name)) {
                         matched = 1;
+                        pr_info("  cmdline '%s' matched\n", buf);
                     }
                 }
             }
         }
 
-        // 2. 若命令行匹配失败，检查 comm 是否为包名的前缀
-        if (!matched) {
-            // comm 通常被截断，检查 name 是否以 comm 开头
-            if (strncmp(name, task->comm, strlen(task->comm)) == 0) {
-                matched = 1;
-            }
-        }
-
         if (matched) {
             pid = task->pid;
+            pr_info("  Found PID %d for '%s'\n", pid, name);
             break;
         }
     }
     rcu_read_unlock();
+
+    if (pid < 0)
+        pr_info("  No process found for '%s'\n", name);
+
     return pid;
 }
 
