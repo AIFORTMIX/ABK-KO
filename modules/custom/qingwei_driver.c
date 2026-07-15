@@ -1,7 +1,7 @@
 // ============================================================================
 // qingwei_basic.c - 精简稳定版（仅内存读写 + 枚举）
 // 使用 vmalloc + mmap 共享内存，无断点/触摸
-// 适用于 Linux 6.1 / Android 14（已修复所有编译错误）
+// 适用于 Linux 6.1 / Android 14（已修复所有编译警告）
 // ============================================================================
 
 #include <linux/module.h>
@@ -22,7 +22,7 @@
 #include <linux/sched/task.h>
 #include <linux/kobject.h>
 #include <linux/dcache.h>
-#include <linux/fs.h>          // kernel_write, vfs_llseek, filp_open
+#include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/file.h>
@@ -34,7 +34,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
 MODULE_DESCRIPTION("qingwei basic memory driver (no BP/touch)");
-MODULE_VERSION("3.2");
+MODULE_VERSION("3.3");
 
 // ============================================================================
 // 协议定义
@@ -94,7 +94,7 @@ static struct device *qingwei_device = NULL;
 static struct cdev qingwei_cdev;
 
 // ============================================================================
-// 文件日志（使用 kernel_write，无 set_fs）
+// 文件日志（使用 kernel_write）
 // ============================================================================
 static void write_kmsg_log(const char *msg) {
     struct file *filp = NULL;
@@ -108,14 +108,11 @@ static void write_kmsg_log(const char *msg) {
         return;
     }
 
-    // 定位到文件末尾
     pos = vfs_llseek(filp, 0, SEEK_END);
-    // 使用 kernel_write 直接写入内核缓冲区
     ret = kernel_write(filp, msg, strlen(msg), &pos);
     if (ret < 0)
         pr_err("qingwei: kernel_write failed %d\n", ret);
 
-    // 刷盘
     vfs_fsync(filp, 0);
     filp_close(filp, NULL);
 }
@@ -332,7 +329,7 @@ static int dispatch_thread_func(void *data) {
 static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
     unsigned long size = vma->vm_end - vma->vm_start;
     struct page *page;
-    int ret;
+    int err;
 
     if (size > PAGE_SIZE) return -EINVAL;
 
@@ -342,10 +339,10 @@ static int qingwei_mmap(struct file *filp, struct vm_area_struct *vma) {
         return -ENOMEM;
     }
 
-    ret = remap_pfn_range(vma, vma->vm_start, page_to_pfn(page), size, vma->vm_page_prot);
-    if (ret) {
-        pr_err("qingwei: remap_pfn_range failed\n");
-        return ret;
+    err = remap_pfn_range(vma, vma->vm_start, page_to_pfn(page), size, vma->vm_page_prot);
+    if (err) {
+        pr_err("qingwei: remap_pfn_range failed with %d\n", err);
+        return err;
     }
 
     pr_info("qingwei: mmap success, user addr 0x%lx, kernel addr %p\n", vma->vm_start, g_req);
