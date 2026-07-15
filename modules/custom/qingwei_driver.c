@@ -1,5 +1,6 @@
 // ============================================================================
-// qingwei_driver.c - 最终版（支持按库名获取基址）
+// qingwei_driver.c - 最终稳定版（按库名查找基址，无枚举）
+// 适用于 Linux 6.1 / Android 14
 // ============================================================================
 
 #include <linux/module.h>
@@ -29,8 +30,8 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
-MODULE_DESCRIPTION("qingwei driver with module base lookup");
-MODULE_VERSION("4.0");
+MODULE_DESCRIPTION("qingwei driver with module base lookup (vm_next fixed)");
+MODULE_VERSION("4.1");
 
 // ============================================================================
 // 协议定义
@@ -41,9 +42,9 @@ enum sm_req_op {
     OP_NULL = 0,
     OP_READ,
     OP_WRITE,
-    OP_MEM_ENUM,                // 保留但不再使用
+    OP_MEM_ENUM,
     OP_KEXIT,
-    OP_GET_MODULE_BASE,         // 新增：获取指定库基址
+    OP_GET_MODULE_BASE,
 };
 
 struct mem_region {
@@ -70,11 +71,11 @@ struct req_obj {
     volatile bool kernel;
     volatile bool user;
     enum sm_req_op op;
-    long status;                // 返回状态（0成功，负值错误）
+    long status;
     int pid;
-    unsigned long target_addr;  // 输出：基址（用于 OP_GET_MODULE_BASE）
+    unsigned long target_addr;
     size_t size;
-    unsigned char user_buffer[USER_BUF_SIZE]; // 输入：库名字符串
+    unsigned char user_buffer[USER_BUF_SIZE];
     struct memory_info mem_info;
 };
 
@@ -195,7 +196,7 @@ static ssize_t write_process_memory(int pid, unsigned long vaddr, const void *bu
 }
 
 // ============================================================================
-// 根据库名获取基址
+// 根据库名获取基址（使用 find_vma，无 vm_next）
 // ============================================================================
 static unsigned long get_module_base(int pid, const char *name) {
     struct task_struct *task;
@@ -204,6 +205,7 @@ static unsigned long get_module_base(int pid, const char *name) {
     unsigned long base = 0;
     char *path = NULL;
     char *buf = NULL;
+    unsigned long start = 0;
 
     rcu_read_lock();
     task = find_task_by_vpid(pid);
@@ -229,17 +231,17 @@ static unsigned long get_module_base(int pid, const char *name) {
         return 0;
     }
 
-    for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        if (!vma->vm_file || !vma->vm_file->f_path.dentry)
-            continue;
-        path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-        if (IS_ERR(path))
-            continue;
-        // 检查路径是否包含库名
-        if (strstr(path, name)) {
-            base = vma->vm_start;
-            break;
+    while ((vma = find_vma(mm, start)) != NULL) {
+        if (vma->vm_file && vma->vm_file->f_path.dentry) {
+            path = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+            if (!IS_ERR(path)) {
+                if (strstr(path, name)) {
+                    base = vma->vm_start;
+                    break;
+                }
+            }
         }
+        start = vma->vm_end;
     }
 
     free_page((unsigned long)buf);
@@ -280,7 +282,6 @@ static int dispatch_thread_func(void *data) {
                 g_req->status = ret;
                 break;
             case OP_GET_MODULE_BASE: {
-                // user_buffer 存放库名，以 '\0' 结尾
                 char *name = (char*)g_req->user_buffer;
                 name[USER_BUF_SIZE - 1] = '\0';
                 unsigned long base = get_module_base(g_req->pid, name);
@@ -294,7 +295,6 @@ static int dispatch_thread_func(void *data) {
                 break;
             }
             case OP_MEM_ENUM:
-                // 保留但不再使用，可简单返回错误
                 g_req->status = -ENOSYS;
                 break;
             case OP_KEXIT:
