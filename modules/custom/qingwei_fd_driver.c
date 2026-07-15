@@ -185,29 +185,43 @@ static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
 }
 
 /* ---------- 按包名查找 PID ---------- */
+/* ---------- 改进的按包名查找 PID ---------- */
 static int find_pid_by_name(const char *name)
 {
     struct task_struct *task;
     int pid = -ESRCH;
-    if (!name || !*name) return -EINVAL;
+    if (!name || !*name)
+        return -EINVAL;
 
     rcu_read_lock();
     for_each_process(task) {
-        if (!strcmp(task->comm, name)) {
-            pid = task->pid;
-            break;
-        }
+        int matched = 0;
+
+        // 1. 检查完整命令行（arg_start）
         if (task->mm && task->mm->arg_start) {
-            char buf[128] = {0};
-            size_t len = min_t(size_t, 127, task->mm->arg_end - task->mm->arg_start);
+            char buf[256] = {0};
+            size_t len = min_t(size_t, sizeof(buf)-1,
+                               task->mm->arg_end - task->mm->arg_start);
             if (len > 0) {
                 if (strncpy_from_user(buf, (char __user *)task->mm->arg_start, len) > 0) {
                     if (strstr(buf, name)) {
-                        pid = task->pid;
-                        break;
+                        matched = 1;
                     }
                 }
             }
+        }
+
+        // 2. 若命令行匹配失败，检查 comm 是否为包名的前缀
+        if (!matched) {
+            // comm 通常被截断，检查 name 是否以 comm 开头
+            if (strncmp(name, task->comm, strlen(task->comm)) == 0) {
+                matched = 1;
+            }
+        }
+
+        if (matched) {
+            pid = task->pid;
+            break;
         }
     }
     rcu_read_unlock();
