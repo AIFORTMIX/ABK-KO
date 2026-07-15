@@ -1,6 +1,7 @@
 // ============================================================================
 // qingwei_basic.c - 精简稳定版（仅内存读写 + 枚举）
 // 使用 vmalloc + mmap 共享内存，无断点/触摸
+// 适用于 Linux 6.1 / Android 14（已修复所有编译错误）
 // ============================================================================
 
 #include <linux/module.h>
@@ -21,7 +22,7 @@
 #include <linux/sched/task.h>
 #include <linux/kobject.h>
 #include <linux/dcache.h>
-#include <linux/fs.h>
+#include <linux/fs.h>          // kernel_write, vfs_llseek, filp_open
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/file.h>
@@ -33,7 +34,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("qingwei");
 MODULE_DESCRIPTION("qingwei basic memory driver (no BP/touch)");
-MODULE_VERSION("3.1");
+MODULE_VERSION("3.2");
 
 // ============================================================================
 // 协议定义
@@ -46,14 +47,6 @@ enum sm_req_op {
     OP_WRITE,
     OP_MEM_ENUM,
     OP_KEXIT,
-    // 以下已注释（断点/触摸）
-    // OP_HWBP_SET,
-    // OP_HWBP_REMOVE,
-    // OP_HWBP_GET_INFO,
-    // OP_TOUCH_DOWN,
-    // OP_TOUCH_MOVE,
-    // OP_TOUCH_UP,
-    // OP_TOUCH_GET_RANGE,
 };
 
 struct mem_region {
@@ -86,36 +79,25 @@ struct req_obj {
     size_t size;
     unsigned char user_buffer[USER_BUF_SIZE];
     struct memory_info mem_info;
-    // 以下字段已注释（断点/触摸相关）
-    // struct hwbp_params hwbp;
-    // struct hwbp_record hwbp_records[MAX_HWBP_RECORDS];
-    // int hwbp_record_count;
-    // int touch_slot;
-    // int touch_x;
-    // int touch_y;
-    // int touch_range_x;
-    // int touch_range_y;
 };
 
 // ============================================================================
 // 全局变量
 // ============================================================================
-static struct req_obj *g_req = NULL;           // vmalloc 分配的内核地址
+static struct req_obj *g_req = NULL;
 static struct task_struct *g_dispatch_thread = NULL;
 static bool g_exiting = false;
 
-// 字符设备
 static int major;
 static struct class *qingwei_class = NULL;
 static struct device *qingwei_device = NULL;
 static struct cdev qingwei_cdev;
 
 // ============================================================================
-// 文件日志（用于调试）
+// 文件日志（使用 kernel_write，无 set_fs）
 // ============================================================================
 static void write_kmsg_log(const char *msg) {
     struct file *filp = NULL;
-    mm_segment_t oldfs;
     loff_t pos = 0;
     char *path = "/data/local/tmp/kmsg.txt";
     int ret;
@@ -126,13 +108,15 @@ static void write_kmsg_log(const char *msg) {
         return;
     }
 
-    oldfs = get_fs();
-    set_fs(KERNEL_DS);
+    // 定位到文件末尾
     pos = vfs_llseek(filp, 0, SEEK_END);
-    ret = vfs_write(filp, msg, strlen(msg), &pos);
-    if (ret < 0) pr_err("qingwei: write log failed %d\n", ret);
+    // 使用 kernel_write 直接写入内核缓冲区
+    ret = kernel_write(filp, msg, strlen(msg), &pos);
+    if (ret < 0)
+        pr_err("qingwei: kernel_write failed %d\n", ret);
+
+    // 刷盘
     vfs_fsync(filp, 0);
-    set_fs(oldfs);
     filp_close(filp, NULL);
 }
 
@@ -298,7 +282,7 @@ static int virtual_memory_enum(int pid, struct memory_info *info) {
 }
 
 // ============================================================================
-// 请求分发线程（仅处理基础操作）
+// 请求分发线程
 // ============================================================================
 static int dispatch_thread_func(void *data) {
     int ret;
@@ -394,7 +378,6 @@ static int __init qingwei_init(void) {
     }
     memset(g_req, 0, sizeof(struct req_obj));
 
-    // 写入地址到日志
     snprintf(buf, sizeof(buf), "vmalloc addr: 0x%p\n", g_req);
     write_kmsg_log("=== qingwei_init ===\n");
     write_kmsg_log(buf);
