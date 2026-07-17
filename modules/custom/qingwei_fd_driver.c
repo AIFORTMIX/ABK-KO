@@ -14,6 +14,7 @@
 #include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <asm/pgtable.h>
 
 #define DEVICE_NAME "qingwei_fd"
@@ -30,11 +31,37 @@ typedef struct {
     unsigned long user_buf;       // 用户态缓冲区（用于传入/传出数据）
 } mem_packet_t;
 
+typedef struct {
+    unsigned long addr;
+    uint32_t size;
+    uint32_t out_offset;
+    int32_t status;
+} mem_batch_item_t;
+
+typedef struct {
+    int pid;
+    char pkg_name[64];
+    uint32_t count;
+    uint32_t item_size;
+    unsigned long items_buf;
+    unsigned long out_buf;
+    size_t out_size;
+} mem_batch_packet_t;
+
 #define MEM_IOCTL_MAGIC 'Q'
 #define CMD_GET_BASE       _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)   // 获取模块基址
 #define CMD_READ_MEM       _IOWR(MEM_IOCTL_MAGIC, 2, mem_packet_t)
 #define CMD_WRITE_MEM      _IOWR(MEM_IOCTL_MAGIC, 3, mem_packet_t)
 #define CMD_READ_PTR       _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)   // 指针链读取
+#define CMD_READ_BATCH     _IOWR(MEM_IOCTL_MAGIC, 5, mem_batch_packet_t)
+
+#define QW_BATCH_MAX_ITEMS 256
+#define QW_BATCH_MAX_SIZE  (1024 * 1024)
+
+static DEFINE_MUTEX(g_task_cache_lock);
+static struct task_struct *g_cached_task;
+static int g_cached_pid = -1;
+static char g_cached_name[64];
 
 /* ---------- ARM64 巨页检测宏 ---------- */
 #ifndef pud_leaf
@@ -193,8 +220,6 @@ static int find_pid_by_name(const char *name)
     if (!name || !*name)
         return -EINVAL;
 
-    pr_info("find_pid_by_name: searching for '%s'\n", name);
-
     rcu_read_lock();
     for_each_process(task) {
         int matched = 0;
@@ -210,10 +235,7 @@ static int find_pid_by_name(const char *name)
                     buf[ret] = '\0';
                     if (strstr(buf, name)) {
                         matched = 1;
-                        pr_info("  cmdline matched: '%s'\n", buf);
                     }
-                } else {
-                    pr_info("  strncpy_from_user failed for pid %d, ret=%ld\n", task->pid, ret);
                 }
             }
         }
@@ -222,28 +244,77 @@ static int find_pid_by_name(const char *name)
         if (!matched) {
             if (strstr(name, task->comm) || strstr(task->comm, name)) {
                 matched = 1;
-                pr_info("  comm '%s' matched (fallback)\n", task->comm);
             }
         }
 
         if (matched) {
             pid = task->pid;
-            pr_info("  Found PID %d for '%s'\n", pid, name);
             break;
-        }
-    }
-
-    if (pid < 0) {
-        pr_info("  No process found, listing first 10 comms:\n");
-        int count = 0;
-        for_each_process(task) {
-            if (count++ < 10)
-                pr_info("    comm: '%s'  pid: %d\n", task->comm, task->pid);
         }
     }
 
     rcu_read_unlock();
     return pid;
+}
+
+static void clear_task_cache_locked(void)
+{
+    if (g_cached_task) {
+        put_task_struct(g_cached_task);
+        g_cached_task = NULL;
+    }
+    g_cached_pid = -1;
+    g_cached_name[0] = '\0';
+}
+
+static struct task_struct *get_cached_task_for_target(int pid, const char *pkg_name)
+{
+    struct task_struct *task = NULL;
+    int target_pid = pid;
+
+    mutex_lock(&g_task_cache_lock);
+    if (g_cached_task && g_cached_pid > 0) {
+        if ((target_pid > 0 && target_pid == g_cached_pid) ||
+            (target_pid <= 0 && pkg_name && pkg_name[0] &&
+             strncmp(g_cached_name, pkg_name, sizeof(g_cached_name)) == 0)) {
+            if (pid_alive(g_cached_task) && g_cached_task->mm) {
+                get_task_struct(g_cached_task);
+                mutex_unlock(&g_task_cache_lock);
+                return g_cached_task;
+            }
+            clear_task_cache_locked();
+        }
+    }
+    mutex_unlock(&g_task_cache_lock);
+
+    if (target_pid <= 0) {
+        target_pid = find_pid_by_name(pkg_name);
+        if (target_pid <= 0)
+            return NULL;
+    }
+
+    rcu_read_lock();
+    task = find_task_by_vpid(target_pid);
+    if (task)
+        get_task_struct(task);
+    rcu_read_unlock();
+    if (!task)
+        return NULL;
+
+    mutex_lock(&g_task_cache_lock);
+    clear_task_cache_locked();
+    g_cached_task = task;
+    get_task_struct(g_cached_task);
+    g_cached_pid = target_pid;
+    if (pkg_name && pkg_name[0]) {
+        strncpy(g_cached_name, pkg_name, sizeof(g_cached_name) - 1);
+        g_cached_name[sizeof(g_cached_name) - 1] = '\0';
+    } else {
+        g_cached_name[0] = '\0';
+    }
+    mutex_unlock(&g_task_cache_lock);
+
+    return task;
 }
 
 /* ---------- 通过 find_vma 获取模块基址 ---------- */
@@ -280,32 +351,70 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     void *kbuf = NULL;
     struct task_struct *task;
     int ret = 0;
-    int pid;
     unsigned long final_addr;
     uint64_t ptr_val;
+
+    if (cmd == CMD_READ_BATCH) {
+        mem_batch_packet_t bpkt;
+        mem_batch_item_t *items = NULL;
+        void *out_buf = NULL;
+        uint32_t i;
+
+        if (copy_from_user(&bpkt, (void __user *)arg, sizeof(bpkt)))
+            return -EFAULT;
+        if (bpkt.count == 0 || bpkt.count > QW_BATCH_MAX_ITEMS ||
+            bpkt.item_size != sizeof(mem_batch_item_t) ||
+            bpkt.out_size == 0 || bpkt.out_size > QW_BATCH_MAX_SIZE)
+            return -EINVAL;
+
+        task = get_cached_task_for_target(bpkt.pid, bpkt.pkg_name);
+        if (!task)
+            return -ESRCH;
+
+        items = kcalloc(bpkt.count, sizeof(mem_batch_item_t), GFP_KERNEL);
+        out_buf = kzalloc(bpkt.out_size, GFP_KERNEL);
+        if (!items || !out_buf) {
+            ret = -ENOMEM;
+            goto batch_out;
+        }
+        if (copy_from_user(items, (void __user *)bpkt.items_buf,
+                           bpkt.count * sizeof(mem_batch_item_t))) {
+            ret = -EFAULT;
+            goto batch_out;
+        }
+
+        for (i = 0; i < bpkt.count; i++) {
+            size_t end = (size_t)items[i].out_offset + (size_t)items[i].size;
+            items[i].status = -EINVAL;
+            if (items[i].size == 0 || items[i].size > PAGE_SIZE || end > bpkt.out_size)
+                continue;
+            ret = manual_read_memory(task, items[i].addr,
+                                     (char *)out_buf + items[i].out_offset,
+                                     items[i].size);
+            items[i].status = (ret > 0) ? 0 : ret;
+        }
+
+        if (copy_to_user((void __user *)bpkt.items_buf, items,
+                         bpkt.count * sizeof(mem_batch_item_t)) ||
+            copy_to_user((void __user *)bpkt.out_buf, out_buf, bpkt.out_size)) {
+            ret = -EFAULT;
+        } else {
+            ret = 0;
+        }
+
+batch_out:
+        if (task)
+            put_task_struct(task);
+        kfree(items);
+        kfree(out_buf);
+        return ret;
+    }
 
     if (copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)))
         return -EFAULT;
 
-    /* 自动查找 PID */
-    if (pkt.pid <= 0) {
-        pid = find_pid_by_name(pkt.pkg_name);
-        if (pid <= 0) {
-            pr_err("process '%s' not found\n", pkt.pkg_name);
-            return -ESRCH;
-        }
-        pkt.pid = pid;
-    } else {
-        pid = pkt.pid;
-    }
-
-    rcu_read_lock();
-    task = find_task_by_vpid(pid);
-    if (task)
-        get_task_struct(task);
-    rcu_read_unlock();
+    task = get_cached_task_for_target(pkt.pid, pkt.pkg_name);
     if (!task) {
-        pr_err("task %d not found\n", pid);
         return -ESRCH;
     }
 
@@ -412,6 +521,9 @@ static int __init mem_reader_init(void)
 
 static void __exit mem_reader_exit(void)
 {
+    mutex_lock(&g_task_cache_lock);
+    clear_task_cache_locked();
+    mutex_unlock(&g_task_cache_lock);
     misc_deregister(&misc_dev);
     pr_info("module unloaded\n");
 }
