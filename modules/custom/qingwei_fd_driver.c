@@ -15,10 +15,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
-#include <linux/kallsyms.h>
-#include <linux/hw_breakpoint.h>
-#include <linux/perf_event.h>      // 确保 struct perf_event 完整
-#include <asm/processor.h>
+#include <linux/vmalloc.h>
 #include <asm/pgtable.h>
 
 #define DEVICE_NAME "qingwei_fd"
@@ -52,37 +49,15 @@ typedef struct {
     size_t out_size;
 } mem_batch_packet_t;
 
-typedef struct {
-    int type;           // 1-exec, 2-read, 3-write, 4-rw
-    unsigned long addr;
-    int len;
-} bp_set_t;
-
-typedef struct {
-    int idx;
-} bp_clear_t;
-
-typedef struct {
-    int pid;
-    unsigned long pc;
-    unsigned long addr;
-    int type;
-    int idx;
-} bp_hit_t;
-
 #define MEM_IOCTL_MAGIC 'Q'
 #define CMD_GET_BASE            _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)
 #define CMD_READ_MEM            _IOWR(MEM_IOCTL_MAGIC, 2, mem_packet_t)
 #define CMD_WRITE_MEM           _IOWR(MEM_IOCTL_MAGIC, 3, mem_packet_t)
 #define CMD_READ_PTR            _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)
 #define CMD_READ_BATCH          _IOWR(MEM_IOCTL_MAGIC, 5, mem_batch_packet_t)
-#define CMD_SET_BREAKPOINT      _IOWR(MEM_IOCTL_MAGIC, 6, bp_set_t)
-#define CMD_CLEAR_BREAKPOINT    _IOW(MEM_IOCTL_MAGIC, 7, int)
-#define CMD_GET_BREAKPOINT_HIT  _IOR(MEM_IOCTL_MAGIC, 8, bp_hit_t)
 
-#define QW_BATCH_MAX_ITEMS 256
-#define QW_BATCH_MAX_SIZE  (1024 * 1024)
-#define QW_MAX_BREAKPOINTS 8
+#define QW_BATCH_MAX_ITEMS 512      // 增大最大项数
+#define QW_BATCH_MAX_SIZE  (2 * 1024 * 1024) // 2MB
 
 /* ---------- 全局变量 ---------- */
 static DEFINE_MUTEX(g_task_cache_lock);
@@ -90,37 +65,7 @@ static struct task_struct *g_cached_task;
 static int g_cached_pid = -1;
 static char g_cached_name[64];
 
-/* ---------- 硬件断点动态函数指针（修正类型） ---------- */
-static struct perf_event *(*hw_bp_register)(struct perf_event_attr *attr,
-                             void (*triggered)(struct perf_event *,
-                                               struct perf_sample_data *,
-                                               struct pt_regs *),
-                             void *context,
-                             struct task_struct *tsk);
-static void (*hw_bp_unregister)(struct perf_event *bp);
-static bool hw_bp_available = false;
-
-struct qw_breakpoint {
-    int id;
-    int type;
-    unsigned long addr;
-    int len;
-    bool active;
-    struct perf_event *event;
-};
-
-static struct qw_breakpoint g_bps[QW_MAX_BREAKPOINTS];
-static DEFINE_SPINLOCK(g_bp_lock);
-static struct {
-    int pid;
-    unsigned long pc;
-    unsigned long addr;
-    int type;
-    struct task_struct *task;
-} g_hit_info;
-static bool g_hit_pending;
-
-/* ---------- ARM64 巨页检测 ---------- */
+/* ---------- ARM64 巨页检测宏 ---------- */
 #ifndef pud_leaf
 #define pud_leaf(pud)   pud_sect(pud)
 #endif
@@ -128,16 +73,12 @@ static bool g_hit_pending;
 #define pmd_leaf(pmd)   pmd_sect(pmd)
 #endif
 
-/* ---------- 手动页表遍历读 ---------- */
-static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
-                              void *kbuf, size_t len)
+/* ---------- 底层读写（已持锁版本） ---------- */
+static int __manual_read_memory_locked(struct mm_struct *mm, unsigned long vaddr,
+                                       void *kbuf, size_t len)
 {
-    struct mm_struct *mm = task->mm;
     size_t done = 0;
     int ret = 0;
-    if (!mm) return -EINVAL;
-
-    mmap_read_lock(mm);
     while (done < len) {
         unsigned long addr = vaddr + done;
         unsigned long remaining = len - done;
@@ -192,11 +133,23 @@ static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
         pte_unmap(pte);
         done += copy_size;
     }
-    mmap_read_unlock(mm);
     return ret ? ret : done;
 }
 
-/* ---------- 手动页表遍历写 ---------- */
+/* ---------- 外层读（自动加锁） ---------- */
+static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
+                              void *kbuf, size_t len)
+{
+    struct mm_struct *mm = task->mm;
+    int ret;
+    if (!mm) return -EINVAL;
+    mmap_read_lock(mm);
+    ret = __manual_read_memory_locked(mm, vaddr, kbuf, len);
+    mmap_read_unlock(mm);
+    return ret;
+}
+
+/* ---------- 手动页表遍历写（仍用原逻辑，加锁） ---------- */
 static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
                                void *kbuf, size_t len)
 {
@@ -390,123 +343,6 @@ static unsigned long get_module_base(struct task_struct *task, const char *mod_n
     return base;
 }
 
-/* ---------- 硬件断点回调 ---------- */
-static void qw_breakpoint_handler(struct perf_event *bp, struct perf_sample_data *data,
-                                  struct pt_regs *regs)
-{
-    struct qw_breakpoint *b = bp->overflow_handler_context;
-    unsigned long flags;
-
-    spin_lock_irqsave(&g_bp_lock, flags);
-    g_hit_info.pid = current->pid;
-    g_hit_info.pc = instruction_pointer(regs);
-    g_hit_info.addr = b->addr;
-    g_hit_info.type = b->type;
-    g_hit_info.task = current;
-    get_task_struct(current);
-    g_hit_pending = true;
-    spin_unlock_irqrestore(&g_bp_lock, flags);
-
-    pr_info("HW Breakpoint hit! PID=%d, PC=0x%lx, type=%d, addr=0x%lx\n",
-            current->pid, g_hit_info.pc, b->type, b->addr);
-    dump_stack();
-}
-
-/* ---------- 硬件断点操作（动态调用） ---------- */
-static int qw_set_breakpoint(unsigned long addr, int type, int len, int *idx)
-{
-    struct perf_event_attr attr;
-    struct perf_event *bp;
-    struct qw_breakpoint *b = NULL;
-    int i, ret = 0;
-
-    if (!hw_bp_available)
-        return -ENOSYS;
-
-    spin_lock(&g_bp_lock);
-    for (i = 0; i < QW_MAX_BREAKPOINTS; i++) {
-        if (!g_bps[i].active) {
-            b = &g_bps[i];
-            break;
-        }
-    }
-    if (!b) {
-        spin_unlock(&g_bp_lock);
-        return -ENOSPC;
-    }
-    spin_unlock(&g_bp_lock);
-
-    memset(&attr, 0, sizeof(attr));
-    attr.type = PERF_TYPE_BREAKPOINT;
-    attr.size = sizeof(attr);
-    attr.bp_addr = addr;
-    attr.bp_len = len;
-
-    switch (type) {
-    case 1: attr.bp_type = HW_BREAKPOINT_X; break;
-    case 2: attr.bp_type = HW_BREAKPOINT_R; break;
-    case 3: attr.bp_type = HW_BREAKPOINT_W; break;
-    case 4: attr.bp_type = HW_BREAKPOINT_R | HW_BREAKPOINT_W; break;
-    default: return -EINVAL;
-    }
-
-    bp = hw_bp_register(&attr, qw_breakpoint_handler, b, NULL);
-    if (IS_ERR(bp)) {
-        ret = PTR_ERR(bp);
-        pr_err("register_user_hw_breakpoint failed: %d\n", ret);
-        return ret;
-    }
-
-    b->id = i;
-    b->type = type;
-    b->addr = addr;
-    b->len = len;
-    b->active = true;
-    b->event = bp;
-
-    *idx = i;
-    return 0;
-}
-
-static void qw_clear_breakpoint(int idx)
-{
-    if (!hw_bp_available)
-        return;
-    if (idx < 0 || idx >= QW_MAX_BREAKPOINTS)
-        return;
-    spin_lock(&g_bp_lock);
-    if (g_bps[idx].active) {
-        hw_bp_unregister(g_bps[idx].event);
-        g_bps[idx].active = false;
-        g_bps[idx].event = NULL;
-    }
-    spin_unlock(&g_bp_lock);
-}
-
-static int qw_get_hit_info(bp_hit_t *hit)
-{
-    unsigned long flags;
-    if (!g_hit_pending)
-        return -ENODATA;
-    spin_lock_irqsave(&g_bp_lock, flags);
-    hit->pid = g_hit_info.pid;
-    hit->pc = g_hit_info.pc;
-    hit->addr = g_hit_info.addr;
-    hit->type = g_hit_info.type;
-    hit->idx = -1;
-    for (int i = 0; i < QW_MAX_BREAKPOINTS; i++) {
-        if (g_bps[i].active && g_bps[i].addr == g_hit_info.addr) {
-            hit->idx = i;
-            break;
-        }
-    }
-    if (g_hit_info.task)
-        put_task_struct(g_hit_info.task);
-    g_hit_pending = false;
-    spin_unlock_irqrestore(&g_bp_lock, flags);
-    return 0;
-}
-
 /* ---------- ioctl 处理 ---------- */
 static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
@@ -535,7 +371,7 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             return -ESRCH;
 
         items = kcalloc(bpkt.count, sizeof(mem_batch_item_t), GFP_KERNEL);
-        out_buf = kzalloc(bpkt.out_size, GFP_KERNEL);
+        out_buf = vmalloc(bpkt.out_size);   // 使用 vmalloc 避免大块连续内存失败
         if (!items || !out_buf) {
             ret = -ENOMEM;
             goto batch_out;
@@ -546,15 +382,22 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             goto batch_out;
         }
 
-        for (i = 0; i < bpkt.count; i++) {
-            size_t end = (size_t)items[i].out_offset + (size_t)items[i].size;
-            items[i].status = -EINVAL;
-            if (items[i].size == 0 || items[i].size > PAGE_SIZE || end > bpkt.out_size)
-                continue;
-            ret = manual_read_memory(task, items[i].addr,
-                                     (char *)out_buf + items[i].out_offset,
-                                     items[i].size);
-            items[i].status = (ret > 0) ? 0 : ret;
+        // 一次性持锁处理所有项
+        if (task->mm) {
+            mmap_read_lock(task->mm);
+            for (i = 0; i < bpkt.count; i++) {
+                size_t end = (size_t)items[i].out_offset + (size_t)items[i].size;
+                items[i].status = -EINVAL;
+                if (items[i].size == 0 || items[i].size > PAGE_SIZE || end > bpkt.out_size)
+                    continue;
+                ret = __manual_read_memory_locked(task->mm, items[i].addr,
+                                                  (char *)out_buf + items[i].out_offset,
+                                                  items[i].size);
+                items[i].status = (ret > 0) ? 0 : ret;
+            }
+            mmap_read_unlock(task->mm);
+        } else {
+            ret = -EINVAL;
         }
 
         if (copy_to_user((void __user *)bpkt.items_buf, items,
@@ -569,39 +412,11 @@ batch_out:
         if (task)
             put_task_struct(task);
         kfree(items);
-        kfree(out_buf);
+        vfree(out_buf);
         return ret;
     }
 
-    if (cmd == CMD_SET_BREAKPOINT) {
-        bp_set_t bp;
-        if (copy_from_user(&bp, (void __user *)arg, sizeof(bp)))
-            return -EFAULT;
-        int idx;
-        ret = qw_set_breakpoint(bp.addr, bp.type, bp.len, &idx);
-        if (ret == 0) {
-            if (copy_to_user((void __user *)arg, &idx, sizeof(int)))
-                ret = -EFAULT;
-        }
-        return ret;
-    }
-    if (cmd == CMD_CLEAR_BREAKPOINT) {
-        int idx;
-        if (copy_from_user(&idx, (void __user *)arg, sizeof(int)))
-            return -EFAULT;
-        qw_clear_breakpoint(idx);
-        return 0;
-    }
-    if (cmd == CMD_GET_BREAKPOINT_HIT) {
-        bp_hit_t hit;
-        ret = qw_get_hit_info(&hit);
-        if (ret == 0) {
-            if (copy_to_user((void __user *)arg, &hit, sizeof(hit)))
-                ret = -EFAULT;
-        }
-        return ret;
-    }
-
+    // 其他命令保持不变
     if (copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)))
         return -EFAULT;
 
@@ -704,17 +519,6 @@ static int __init mem_reader_init(void)
         return ret;
     }
 
-    // 动态解析硬件断点函数
-    hw_bp_register = (void *)kallsyms_lookup_name("register_user_hw_breakpoint");
-    hw_bp_unregister = (void *)kallsyms_lookup_name("unregister_hw_breakpoint");
-    if (hw_bp_register && hw_bp_unregister) {
-        hw_bp_available = true;
-        pr_info("Hardware breakpoint functions loaded successfully\n");
-    } else {
-        hw_bp_available = false;
-        pr_info("Hardware breakpoint functions not available, breakpoint feature disabled\n");
-    }
-
     strcpy((char *)THIS_MODULE->name, MODULE_HIDE_NAME);
     pr_info("device /dev/%s ready (shown as '%s' in lsmod)\n", DEVICE_NAME, MODULE_HIDE_NAME);
     return 0;
@@ -725,14 +529,6 @@ static void __exit mem_reader_exit(void)
     mutex_lock(&g_task_cache_lock);
     clear_task_cache_locked();
     mutex_unlock(&g_task_cache_lock);
-
-    // 清除所有断点（如果可用）
-    if (hw_bp_available) {
-        for (int i = 0; i < QW_MAX_BREAKPOINTS; i++) {
-            if (g_bps[i].active)
-                qw_clear_breakpoint(i);
-        }
-    }
     misc_deregister(&misc_dev);
     pr_info("module unloaded\n");
 }
@@ -742,4 +538,4 @@ module_exit(mem_reader_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Security Researcher");
-MODULE_DESCRIPTION("ARM64 memory R/W with optional HW breakpoint (dynamically resolved)");
+MODULE_DESCRIPTION("Optimized ARM64 memory R/W with batch support for Android 6.1.138");
