@@ -16,7 +16,8 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/kallsyms.h>
-#include <linux/hw_breakpoint.h>   // 仅用于类型定义，不会链接
+#include <linux/hw_breakpoint.h>
+#include <linux/perf_event.h>      // 确保 struct perf_event 完整
 #include <asm/processor.h>
 #include <asm/pgtable.h>
 
@@ -89,8 +90,8 @@ static struct task_struct *g_cached_task;
 static int g_cached_pid = -1;
 static char g_cached_name[64];
 
-/* ---------- 硬件断点动态函数指针 ---------- */
-static int (*hw_bp_register)(struct perf_event_attr *attr,
+/* ---------- 硬件断点动态函数指针（修正类型） ---------- */
+static struct perf_event *(*hw_bp_register)(struct perf_event_attr *attr,
                              void (*triggered)(struct perf_event *,
                                                struct perf_sample_data *,
                                                struct pt_regs *),
