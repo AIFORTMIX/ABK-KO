@@ -15,9 +15,9 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
-#include <linux/hw_breakpoint.h>
-#include <asm/processor.h>
 #include <linux/kallsyms.h>
+#include <linux/hw_breakpoint.h>   // 仅用于类型定义，不会链接
+#include <asm/processor.h>
 #include <asm/pgtable.h>
 
 #define DEVICE_NAME "qingwei_fd"
@@ -88,6 +88,16 @@ static DEFINE_MUTEX(g_task_cache_lock);
 static struct task_struct *g_cached_task;
 static int g_cached_pid = -1;
 static char g_cached_name[64];
+
+/* ---------- 硬件断点动态函数指针 ---------- */
+static int (*hw_bp_register)(struct perf_event_attr *attr,
+                             void (*triggered)(struct perf_event *,
+                                               struct perf_sample_data *,
+                                               struct pt_regs *),
+                             void *context,
+                             struct task_struct *tsk);
+static void (*hw_bp_unregister)(struct perf_event *bp);
+static bool hw_bp_available = false;
 
 struct qw_breakpoint {
     int id;
@@ -267,12 +277,10 @@ static int find_pid_by_name(const char *name)
 
     rcu_read_lock();
     for_each_process(task) {
-        // 优先匹配 comm
         if (strstr(name, task->comm) || strstr(task->comm, name)) {
             pid = task->pid;
             break;
         }
-        // 后备：命令行
         if (task->mm && task->mm->arg_start) {
             char buf[512] = {0};
             size_t len = min_t(size_t, sizeof(buf)-1,
@@ -381,7 +389,7 @@ static unsigned long get_module_base(struct task_struct *task, const char *mod_n
     return base;
 }
 
-/* ---------- 硬件断点 ---------- */
+/* ---------- 硬件断点回调 ---------- */
 static void qw_breakpoint_handler(struct perf_event *bp, struct perf_sample_data *data,
                                   struct pt_regs *regs)
 {
@@ -403,12 +411,16 @@ static void qw_breakpoint_handler(struct perf_event *bp, struct perf_sample_data
     dump_stack();
 }
 
+/* ---------- 硬件断点操作（动态调用） ---------- */
 static int qw_set_breakpoint(unsigned long addr, int type, int len, int *idx)
 {
     struct perf_event_attr attr;
     struct perf_event *bp;
     struct qw_breakpoint *b = NULL;
     int i, ret = 0;
+
+    if (!hw_bp_available)
+        return -ENOSYS;
 
     spin_lock(&g_bp_lock);
     for (i = 0; i < QW_MAX_BREAKPOINTS; i++) {
@@ -437,8 +449,7 @@ static int qw_set_breakpoint(unsigned long addr, int type, int len, int *idx)
     default: return -EINVAL;
     }
 
-    // 修正：context=b, tsk=NULL
-    bp = register_user_hw_breakpoint(&attr, qw_breakpoint_handler, b, NULL);
+    bp = hw_bp_register(&attr, qw_breakpoint_handler, b, NULL);
     if (IS_ERR(bp)) {
         ret = PTR_ERR(bp);
         pr_err("register_user_hw_breakpoint failed: %d\n", ret);
@@ -458,11 +469,13 @@ static int qw_set_breakpoint(unsigned long addr, int type, int len, int *idx)
 
 static void qw_clear_breakpoint(int idx)
 {
+    if (!hw_bp_available)
+        return;
     if (idx < 0 || idx >= QW_MAX_BREAKPOINTS)
         return;
     spin_lock(&g_bp_lock);
     if (g_bps[idx].active) {
-        unregister_hw_breakpoint(g_bps[idx].event);
+        hw_bp_unregister(g_bps[idx].event);
         g_bps[idx].active = false;
         g_bps[idx].event = NULL;
     }
@@ -690,6 +703,17 @@ static int __init mem_reader_init(void)
         return ret;
     }
 
+    // 动态解析硬件断点函数
+    hw_bp_register = (void *)kallsyms_lookup_name("register_user_hw_breakpoint");
+    hw_bp_unregister = (void *)kallsyms_lookup_name("unregister_hw_breakpoint");
+    if (hw_bp_register && hw_bp_unregister) {
+        hw_bp_available = true;
+        pr_info("Hardware breakpoint functions loaded successfully\n");
+    } else {
+        hw_bp_available = false;
+        pr_info("Hardware breakpoint functions not available, breakpoint feature disabled\n");
+    }
+
     strcpy((char *)THIS_MODULE->name, MODULE_HIDE_NAME);
     pr_info("device /dev/%s ready (shown as '%s' in lsmod)\n", DEVICE_NAME, MODULE_HIDE_NAME);
     return 0;
@@ -701,10 +725,12 @@ static void __exit mem_reader_exit(void)
     clear_task_cache_locked();
     mutex_unlock(&g_task_cache_lock);
 
-    // 清除所有断点
-    for (int i = 0; i < QW_MAX_BREAKPOINTS; i++) {
-        if (g_bps[i].active)
-            qw_clear_breakpoint(i);
+    // 清除所有断点（如果可用）
+    if (hw_bp_available) {
+        for (int i = 0; i < QW_MAX_BREAKPOINTS; i++) {
+            if (g_bps[i].active)
+                qw_clear_breakpoint(i);
+        }
     }
     misc_deregister(&misc_dev);
     pr_info("module unloaded\n");
@@ -715,4 +741,4 @@ module_exit(mem_reader_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Security Researcher");
-MODULE_DESCRIPTION("ARM64 memory R/W with hardware breakpoint support for Android 6.1.138");
+MODULE_DESCRIPTION("ARM64 memory R/W with optional HW breakpoint (dynamically resolved)");
