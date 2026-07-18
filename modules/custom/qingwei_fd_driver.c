@@ -25,13 +25,13 @@
 
 /* ---------- 用户态接口 ---------- */
 typedef struct {
-    int pid;                      // 目标PID（≤0时用pkg_name自动查找）
-    char pkg_name[64];            // 包名/进程名
-    unsigned long addr;           // 目标虚拟地址
-    size_t size;                  // 读写大小（字节）
-    unsigned long offsets[8];     // 指针链偏移（最多8级）
-    int offset_count;             // 偏移个数，0表示直接地址
-    unsigned long user_buf;       // 用户态缓冲区（用于传入/传出数据）
+    int pid;
+    char pkg_name[64];
+    unsigned long addr;
+    size_t size;
+    unsigned long offsets[8];
+    int offset_count;
+    unsigned long user_buf;
 } mem_packet_t;
 
 typedef struct {
@@ -51,15 +51,14 @@ typedef struct {
     size_t out_size;
 } mem_batch_packet_t;
 
-// 断点相关结构
 typedef struct {
     int type;           // 1-exec, 2-read, 3-write, 4-rw
     unsigned long addr;
-    int len;            // 1,2,4,8
+    int len;
 } bp_set_t;
 
 typedef struct {
-    int idx;            // 要清除的断点索引
+    int idx;
 } bp_clear_t;
 
 typedef struct {
@@ -67,7 +66,7 @@ typedef struct {
     unsigned long pc;
     unsigned long addr;
     int type;
-    int idx;            // 触发的断点索引
+    int idx;
 } bp_hit_t;
 
 #define MEM_IOCTL_MAGIC 'Q'
@@ -90,15 +89,16 @@ static struct task_struct *g_cached_task;
 static int g_cached_pid = -1;
 static char g_cached_name[64];
 
-// 断点相关
-static struct qw_breakpoint {
+struct qw_breakpoint {
     int id;
     int type;
     unsigned long addr;
     int len;
     bool active;
     struct perf_event *event;
-} g_bps[QW_MAX_BREAKPOINTS];
+};
+
+static struct qw_breakpoint g_bps[QW_MAX_BREAKPOINTS];
 static DEFINE_SPINLOCK(g_bp_lock);
 static struct {
     int pid;
@@ -109,7 +109,7 @@ static struct {
 } g_hit_info;
 static bool g_hit_pending;
 
-/* ---------- ARM64 巨页检测宏 ---------- */
+/* ---------- ARM64 巨页检测 ---------- */
 #ifndef pud_leaf
 #define pud_leaf(pud)   pud_sect(pud)
 #endif
@@ -257,7 +257,7 @@ static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
     return ret ? ret : done;
 }
 
-/* ---------- 进程查找：优先 comm，后备 cmdline ---------- */
+/* ---------- 进程查找：优先 comm ---------- */
 static int find_pid_by_name(const char *name)
 {
     struct task_struct *task;
@@ -267,12 +267,12 @@ static int find_pid_by_name(const char *name)
 
     rcu_read_lock();
     for_each_process(task) {
-        // 1. 优先检查 comm（短名）
+        // 优先匹配 comm
         if (strstr(name, task->comm) || strstr(task->comm, name)) {
             pid = task->pid;
             break;
         }
-        // 2. 如果 comm 匹配失败，再尝试完整命令行
+        // 后备：命令行
         if (task->mm && task->mm->arg_start) {
             char buf[512] = {0};
             size_t len = min_t(size_t, sizeof(buf)-1,
@@ -381,7 +381,7 @@ static unsigned long get_module_base(struct task_struct *task, const char *mod_n
     return base;
 }
 
-/* ---------- 硬件断点相关 ---------- */
+/* ---------- 硬件断点 ---------- */
 static void qw_breakpoint_handler(struct perf_event *bp, struct perf_sample_data *data,
                                   struct pt_regs *regs)
 {
@@ -437,7 +437,8 @@ static int qw_set_breakpoint(unsigned long addr, int type, int len, int *idx)
     default: return -EINVAL;
     }
 
-    bp = register_user_hw_breakpoint(&attr, qw_breakpoint_handler, NULL, b);
+    // 修正：context=b, tsk=NULL
+    bp = register_user_hw_breakpoint(&attr, qw_breakpoint_handler, b, NULL);
     if (IS_ERR(bp)) {
         ret = PTR_ERR(bp);
         pr_err("register_user_hw_breakpoint failed: %d\n", ret);
@@ -502,7 +503,6 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     unsigned long final_addr;
     uint64_t ptr_val;
 
-    // 批量读取
     if (cmd == CMD_READ_BATCH) {
         mem_batch_packet_t bpkt;
         mem_batch_item_t *items = NULL;
@@ -559,7 +559,6 @@ batch_out:
         return ret;
     }
 
-    // 断点相关命令（无需目标进程）
     if (cmd == CMD_SET_BREAKPOINT) {
         bp_set_t bp;
         if (copy_from_user(&bp, (void __user *)arg, sizeof(bp)))
@@ -589,7 +588,6 @@ batch_out:
         return ret;
     }
 
-    // 其他命令需要目标进程
     if (copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)))
         return -EFAULT;
 
@@ -702,6 +700,7 @@ static void __exit mem_reader_exit(void)
     mutex_lock(&g_task_cache_lock);
     clear_task_cache_locked();
     mutex_unlock(&g_task_cache_lock);
+
     // 清除所有断点
     for (int i = 0; i < QW_MAX_BREAKPOINTS; i++) {
         if (g_bps[i].active)
