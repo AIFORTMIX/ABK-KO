@@ -16,6 +16,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
+#include <linux/ktime.h>
 #include <asm/pgtable.h>
 
 #define DEVICE_NAME "qingwei_fd"
@@ -49,21 +50,31 @@ typedef struct {
     size_t out_size;
 } mem_batch_packet_t;
 
+typedef struct {
+    unsigned long long cpu_time_ns;   // 模块累计 CPU 时间（纳秒）
+    unsigned long long call_count;    // 总 ioctl 调用次数
+    unsigned long mem_bytes;          // 模块常驻内存大小（字节）
+} module_info_t;
+
 #define MEM_IOCTL_MAGIC 'Q'
 #define CMD_GET_BASE            _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)
 #define CMD_READ_MEM            _IOWR(MEM_IOCTL_MAGIC, 2, mem_packet_t)
 #define CMD_WRITE_MEM           _IOWR(MEM_IOCTL_MAGIC, 3, mem_packet_t)
 #define CMD_READ_PTR            _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)
 #define CMD_READ_BATCH          _IOWR(MEM_IOCTL_MAGIC, 5, mem_batch_packet_t)
+#define CMD_GET_MODULE_INFO     _IOR(MEM_IOCTL_MAGIC, 6, module_info_t)
 
-#define QW_BATCH_MAX_ITEMS 512      // 增大最大项数
-#define QW_BATCH_MAX_SIZE  (2 * 1024 * 1024) // 2MB
+#define QW_BATCH_MAX_ITEMS 512
+#define QW_BATCH_MAX_SIZE  (2 * 1024 * 1024)
 
 /* ---------- 全局变量 ---------- */
 static DEFINE_MUTEX(g_task_cache_lock);
 static struct task_struct *g_cached_task;
 static int g_cached_pid = -1;
 static char g_cached_name[64];
+
+static atomic64_t g_total_cpu_ns = ATOMIC64_INIT(0);
+static atomic64_t g_call_count = ATOMIC64_INIT(0);
 
 /* ---------- ARM64 巨页检测宏 ---------- */
 #ifndef pud_leaf
@@ -149,7 +160,7 @@ static int manual_read_memory(struct task_struct *task, unsigned long vaddr,
     return ret;
 }
 
-/* ---------- 手动页表遍历写（仍用原逻辑，加锁） ---------- */
+/* ---------- 手动页表遍历写 ---------- */
 static int manual_write_memory(struct task_struct *task, unsigned long vaddr,
                                void *kbuf, size_t len)
 {
@@ -346,10 +357,25 @@ static unsigned long get_module_base(struct task_struct *task, const char *mod_n
 /* ---------- ioctl 处理 ---------- */
 static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+    u64 start = ktime_get_ns();
+    long ret = 0;
+
+    if (cmd == CMD_GET_MODULE_INFO) {
+        module_info_t info;
+        info.cpu_time_ns = atomic64_read(&g_total_cpu_ns);
+        info.call_count = atomic64_read(&g_call_count);
+        info.mem_bytes = THIS_MODULE->core_layout.size;
+        if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+            ret = -EFAULT;
+        else
+            ret = 0;
+        goto out;
+    }
+
+    // 其他命令需要处理...
     mem_packet_t pkt;
     void *kbuf = NULL;
     struct task_struct *task;
-    int ret = 0;
     unsigned long final_addr;
     uint64_t ptr_val;
 
@@ -359,19 +385,25 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         void *out_buf = NULL;
         uint32_t i;
 
-        if (copy_from_user(&bpkt, (void __user *)arg, sizeof(bpkt)))
-            return -EFAULT;
+        if (copy_from_user(&bpkt, (void __user *)arg, sizeof(bpkt))) {
+            ret = -EFAULT;
+            goto out;
+        }
         if (bpkt.count == 0 || bpkt.count > QW_BATCH_MAX_ITEMS ||
             bpkt.item_size != sizeof(mem_batch_item_t) ||
-            bpkt.out_size == 0 || bpkt.out_size > QW_BATCH_MAX_SIZE)
-            return -EINVAL;
+            bpkt.out_size == 0 || bpkt.out_size > QW_BATCH_MAX_SIZE) {
+            ret = -EINVAL;
+            goto out;
+        }
 
         task = get_cached_task_for_target(bpkt.pid, bpkt.pkg_name);
-        if (!task)
-            return -ESRCH;
+        if (!task) {
+            ret = -ESRCH;
+            goto out;
+        }
 
         items = kcalloc(bpkt.count, sizeof(mem_batch_item_t), GFP_KERNEL);
-        out_buf = vmalloc(bpkt.out_size);   // 使用 vmalloc 避免大块连续内存失败
+        out_buf = vmalloc(bpkt.out_size);
         if (!items || !out_buf) {
             ret = -ENOMEM;
             goto batch_out;
@@ -382,7 +414,6 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             goto batch_out;
         }
 
-        // 一次性持锁处理所有项
         if (task->mm) {
             mmap_read_lock(task->mm);
             for (i = 0; i < bpkt.count; i++) {
@@ -390,10 +421,10 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
                 items[i].status = -EINVAL;
                 if (items[i].size == 0 || items[i].size > PAGE_SIZE || end > bpkt.out_size)
                     continue;
-                ret = __manual_read_memory_locked(task->mm, items[i].addr,
-                                                  (char *)out_buf + items[i].out_offset,
-                                                  items[i].size);
-                items[i].status = (ret > 0) ? 0 : ret;
+                int r = __manual_read_memory_locked(task->mm, items[i].addr,
+                                                    (char *)out_buf + items[i].out_offset,
+                                                    items[i].size);
+                items[i].status = (r > 0) ? 0 : r;
             }
             mmap_read_unlock(task->mm);
         } else {
@@ -413,16 +444,18 @@ batch_out:
             put_task_struct(task);
         kfree(items);
         vfree(out_buf);
-        return ret;
+        goto out;
     }
 
-    // 其他命令保持不变
-    if (copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)))
-        return -EFAULT;
+    if (copy_from_user(&pkt, (void __user *)arg, sizeof(pkt))) {
+        ret = -EFAULT;
+        goto out;
+    }
 
     task = get_cached_task_for_target(pkt.pid, pkt.pkg_name);
     if (!task) {
-        return -ESRCH;
+        ret = -ESRCH;
+        goto out;
     }
 
     switch (cmd) {
@@ -495,6 +528,13 @@ batch_out:
     if (task)
         put_task_struct(task);
     kfree(kbuf);
+
+out:
+    {
+        u64 delta = ktime_get_ns() - start;
+        atomic64_add(delta, &g_total_cpu_ns);
+        atomic64_inc(&g_call_count);
+    }
     return ret;
 }
 
@@ -538,4 +578,4 @@ module_exit(mem_reader_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Security Researcher");
-MODULE_DESCRIPTION("Optimized ARM64 memory R/W with batch support for Android 6.1.138");
+MODULE_DESCRIPTION("Optimized ARM64 memory R/W with batch support and module info");
