@@ -604,7 +604,8 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         info.cpu_time_ns = atomic64_read(&g_total_cpu_ns);
         info.call_count = atomic64_read(&g_call_count);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-        info.mem_bytes = THIS_MODULE->core.size;
+        /* 针对 Android 6.6 内核，很多保留 core_size 直接成员 */
+        info.mem_bytes = THIS_MODULE->core_size;
 #else
         info.mem_bytes = THIS_MODULE->core_layout.size;
 #endif
