@@ -17,7 +17,7 @@
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
 #include <linux/ktime.h>
-#include <linux/kallsyms.h>
+#include <linux/kprobes.h>
 #include <asm/pgtable.h>
 
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
@@ -31,6 +31,23 @@ typedef void (*unregister_hw_bp_fn)(struct perf_event *bp);
 
 static register_user_hw_bp_fn g_register_user_hw_bp = NULL;
 static unregister_hw_bp_fn g_unregister_hw_bp = NULL;
+
+/* 通过 kprobe 解析未导出符号（Android 6.1 唯一可靠方式） */
+static unsigned long resolve_symbol(const char *name)
+{
+    struct kprobe kp;
+    unsigned long addr;
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = name;
+
+    if (register_kprobe(&kp) < 0)
+        return 0;
+
+    addr = (unsigned long)kp.addr;
+    unregister_kprobe(&kp);
+    return addr;
+}
 #endif
 
 #define DEVICE_NAME "qingwei_fd"
@@ -813,17 +830,17 @@ static int __init mem_reader_init(void)
     }
 
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
-    /* Android 内核未导出 register_user_hw_breakpoint / unregister_hw_breakpoint，
-     * 通过 kallsyms 动态解析 */
+    /* Android GKI 6.1 不导出 register_user_hw_breakpoint / unregister_hw_breakpoint，
+     * 通过 kprobe 临时注册解析符号地址 */
     g_register_user_hw_bp = (register_user_hw_bp_fn)
-        kallsyms_lookup_name("register_user_hw_breakpoint");
+        resolve_symbol("register_user_hw_breakpoint");
     g_unregister_hw_bp = (unregister_hw_bp_fn)
-        kallsyms_lookup_name("unregister_hw_breakpoint");
+        resolve_symbol("unregister_hw_breakpoint");
 
     if (g_register_user_hw_bp && g_unregister_hw_bp) {
-        pr_info("HWBP symbols resolved via kallsyms\n");
+        pr_info("HWBP symbols resolved via kprobe\n");
     } else {
-        pr_warn("HWBP symbols not found via kallsyms, HWBP disabled\n");
+        pr_warn("HWBP symbols not found via kprobe, HWBP disabled\n");
     }
 #endif
 
