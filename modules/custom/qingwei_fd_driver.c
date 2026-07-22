@@ -17,11 +17,20 @@
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
 #include <linux/ktime.h>
+#include <linux/kallsyms.h>
 #include <asm/pgtable.h>
 
 #ifdef CONFIG_HAVE_HW_BREAKPOINT
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
+
+/* 动态解析未导出的 HWBP 符号 */
+typedef struct perf_event *(*register_user_hw_bp_fn)(struct perf_event_attr *attr,
+    perf_overflow_handler_t triggered, void *context, struct task_struct *tsk);
+typedef void (*unregister_hw_bp_fn)(struct perf_event *bp);
+
+static register_user_hw_bp_fn g_register_user_hw_bp = NULL;
+static unregister_hw_bp_fn g_unregister_hw_bp = NULL;
 #endif
 
 #define DEVICE_NAME "qingwei_fd"
@@ -96,7 +105,7 @@ static bool g_hw_bp_active = false;
 #define SNAPSHOT_CACHE_SIZE 256
 struct snapshot_entry {
     unsigned long obj_addr;
-    float x, y, z;
+    u32 x_raw, y_raw, z_raw;   /* 原始 reg 值（用户态转 float） */
     unsigned long jiffies;
 };
 static struct snapshot_entry g_snapshots[SNAPSHOT_CACHE_SIZE];
@@ -408,30 +417,30 @@ static void hw_bp_overflow_handler(struct perf_event *event,
                                     struct pt_regs *regs)
 {
     unsigned long obj_addr;
-    float x, y, z;
+    u32 raw_x, raw_y, raw_z;
 
     if (!regs)
         return;
 
-    /* 读取寄存器：X19=Pawn, X8/X9/X10=坐标 */
+    /* 读取寄存器：X19=Pawn, X8/X9/X10=坐标（低32位） */
     obj_addr = regs->regs[19];
-    x = *(float *)&regs->regs[8];
-    y = *(float *)&regs->regs[9];
-    z = *(float *)&regs->regs[10];
+    raw_x = (u32)regs->regs[8];
+    raw_y = (u32)regs->regs[9];
+    raw_z = (u32)regs->regs[10];
 
     /* 跳过无效地址 */
     if (obj_addr < 0x100000)
         return;
 
-    /* 跳过明显无效的坐标 */
-    if (x == 0.0f && y == 0.0f && z == 0.0f)
+    /* 跳过全零坐标（内核中禁止 float 运算，用 u32 比较） */
+    if (raw_x == 0 && raw_y == 0 && raw_z == 0)
         return;
 
     spin_lock(&g_snapshot_lock);
     g_snapshots[g_snapshot_head].obj_addr = obj_addr;
-    g_snapshots[g_snapshot_head].x = x;
-    g_snapshots[g_snapshot_head].y = y;
-    g_snapshots[g_snapshot_head].z = z;
+    g_snapshots[g_snapshot_head].x_raw = raw_x;
+    g_snapshots[g_snapshot_head].y_raw = raw_y;
+    g_snapshots[g_snapshot_head].z_raw = raw_z;
     g_snapshots[g_snapshot_head].jiffies = jiffies;
     g_snapshot_head = (g_snapshot_head + 1) % SNAPSHOT_CACHE_SIZE;
     if (g_snapshot_count < SNAPSHOT_CACHE_SIZE)
@@ -442,7 +451,8 @@ static void hw_bp_overflow_handler(struct perf_event *event,
 static void hw_bp_cleanup(void)
 {
     if (g_hw_bp_event) {
-        unregister_hw_breakpoint(g_hw_bp_event);
+        if (g_unregister_hw_bp)
+            g_unregister_hw_bp(g_hw_bp_event);
         g_hw_bp_event = NULL;
     }
     if (g_hw_bp_target_task) {
@@ -466,6 +476,11 @@ static int hw_bp_setup(struct task_struct *task, unsigned long bp_addr,
     struct perf_event_attr attr;
     int err;
 
+    if (!g_register_user_hw_bp) {
+        pr_err("HWBP: register_user_hw_breakpoint not found via kallsyms\n");
+        return -ENOSYS;
+    }
+
     /* 先清理旧断点 */
     hw_bp_cleanup();
 
@@ -475,7 +490,7 @@ static int hw_bp_setup(struct task_struct *task, unsigned long bp_addr,
     attr.bp_len = HW_BREAKPOINT_LEN_4;   /* A64 指令 = 4 字节 */
     attr.bp_type = HW_BREAKPOINT_X;       /* 执行断点 */
 
-    g_hw_bp_event = register_user_hw_breakpoint(&attr,
+    g_hw_bp_event = g_register_user_hw_bp(&attr,
                          hw_bp_overflow_handler, NULL, task);
     if (IS_ERR(g_hw_bp_event)) {
         err = PTR_ERR(g_hw_bp_event);
@@ -518,7 +533,7 @@ static int hw_bp_update_blr(struct task_struct *task,
 }
 
 static int hw_bp_query_snapshot(unsigned long obj_addr,
-                                 float *x, float *y, float *z)
+                                 u32 *x_raw, u32 *y_raw, u32 *z_raw)
 {
     int i;
     int found = -2; /* 默认：暂无快照 */
@@ -528,9 +543,9 @@ static int hw_bp_query_snapshot(unsigned long obj_addr,
     for (i = 0; i < g_snapshot_count; i++) {
         int idx = (g_snapshot_head - 1 - i + SNAPSHOT_CACHE_SIZE) % SNAPSHOT_CACHE_SIZE;
         if (g_snapshots[idx].obj_addr == obj_addr) {
-            *x = g_snapshots[idx].x;
-            *y = g_snapshots[idx].y;
-            *z = g_snapshots[idx].z;
+            *x_raw = g_snapshots[idx].x_raw;
+            *y_raw = g_snapshots[idx].y_raw;
+            *z_raw = g_snapshots[idx].z_raw;
             found = 0; /* 命中 */
             break;
         }
@@ -547,7 +562,7 @@ static int hw_bp_setup(struct task_struct *task, unsigned long bp_addr,
 static int hw_bp_update_blr(struct task_struct *task,
                               unsigned long blr_x8, unsigned long blr_x9) { return -ENOSYS; }
 static int hw_bp_query_snapshot(unsigned long obj_addr,
-                                 float *x, float *y, float *z) { return -ENOSYS; }
+                                 u32 *x_raw, u32 *y_raw, u32 *z_raw) { return -ENOSYS; }
 #endif /* CONFIG_HAVE_HW_BREAKPOINT */
 
 /* ---------- ioctl 处理 ---------- */
@@ -745,7 +760,7 @@ batch_out:
 
     case CMD_QUERY_SNAPSHOT: {
         unsigned long obj_addr = pkt.addr;
-        float result[3] = {0, 0, 0};
+        u32 result[3] = {0, 0, 0};
         int status;
 
         status = hw_bp_query_snapshot(obj_addr, &result[0], &result[1], &result[2]);
@@ -796,6 +811,21 @@ static int __init mem_reader_init(void)
         pr_err("misc_register failed\n");
         return ret;
     }
+
+#ifdef CONFIG_HAVE_HW_BREAKPOINT
+    /* Android 内核未导出 register_user_hw_breakpoint / unregister_hw_breakpoint，
+     * 通过 kallsyms 动态解析 */
+    g_register_user_hw_bp = (register_user_hw_bp_fn)
+        kallsyms_lookup_name("register_user_hw_breakpoint");
+    g_unregister_hw_bp = (unregister_hw_bp_fn)
+        kallsyms_lookup_name("unregister_hw_breakpoint");
+
+    if (g_register_user_hw_bp && g_unregister_hw_bp) {
+        pr_info("HWBP symbols resolved via kallsyms\n");
+    } else {
+        pr_warn("HWBP symbols not found via kallsyms, HWBP disabled\n");
+    }
+#endif
 
     strcpy((char *)THIS_MODULE->name, MODULE_HIDE_NAME);
     pr_info("device /dev/%s ready (shown as '%s' in lsmod)"
