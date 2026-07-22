@@ -19,6 +19,11 @@
 #include <linux/ktime.h>
 #include <asm/pgtable.h>
 
+#ifdef CONFIG_HAVE_HW_BREAKPOINT
+#include <linux/perf_event.h>
+#include <linux/hw_breakpoint.h>
+#endif
+
 #define DEVICE_NAME "qingwei_fd"
 #define MODULE_HIDE_NAME "vfat"
 
@@ -63,6 +68,9 @@ typedef struct {
 #define CMD_READ_PTR            _IOWR(MEM_IOCTL_MAGIC, 4, mem_packet_t)
 #define CMD_READ_BATCH          _IOWR(MEM_IOCTL_MAGIC, 5, mem_batch_packet_t)
 #define CMD_GET_MODULE_INFO     _IOR(MEM_IOCTL_MAGIC, 6, module_info_t)
+#define CMD_SET_HW_BP           _IOW(MEM_IOCTL_MAGIC, 7, mem_packet_t)
+#define CMD_SET_BLR_ADDRS       _IOW(MEM_IOCTL_MAGIC, 8, mem_packet_t)
+#define CMD_QUERY_SNAPSHOT      _IOWR(MEM_IOCTL_MAGIC, 9, mem_packet_t)
 
 #define QW_BATCH_MAX_ITEMS 512
 #define QW_BATCH_MAX_SIZE  (2 * 1024 * 1024)
@@ -75,6 +83,27 @@ static char g_cached_name[64];
 
 static atomic64_t g_total_cpu_ns = ATOMIC64_INIT(0);
 static atomic64_t g_call_count = ATOMIC64_INIT(0);
+
+/* ---------- HW Breakpoint 状态 ---------- */
+#ifdef CONFIG_HAVE_HW_BREAKPOINT
+static struct perf_event *g_hw_bp_event = NULL;
+static struct task_struct *g_hw_bp_target_task = NULL;
+static unsigned long g_blr_x8_addr = 0;
+static unsigned long g_blr_x9_addr = 0;
+static bool g_hw_bp_active = false;
+
+/* ---------- 坐标快照缓存（环形缓冲区，spinlock 保护） ---------- */
+#define SNAPSHOT_CACHE_SIZE 256
+struct snapshot_entry {
+    unsigned long obj_addr;
+    float x, y, z;
+    unsigned long jiffies;
+};
+static struct snapshot_entry g_snapshots[SNAPSHOT_CACHE_SIZE];
+static int g_snapshot_head = 0;
+static int g_snapshot_count = 0;
+static DEFINE_SPINLOCK(g_snapshot_lock);
+#endif
 
 /* ---------- ARM64 巨页检测宏 ---------- */
 #ifndef pud_leaf
@@ -354,6 +383,173 @@ static unsigned long get_module_base(struct task_struct *task, const char *mod_n
     return base;
 }
 
+#ifdef CONFIG_HAVE_HW_BREAKPOINT
+/* ===================================================================
+ * 硬件断点 (HW Breakpoint) 功能
+ *
+ * 原理：
+ *   在目标进程中设置 ARM64 执行断点（DBGBVR/DBGBCR），
+ *   当断点触发时 overflow handler 读取 pt_regs 中的寄存器值，
+ *   将解密后的坐标缓存到内核环形缓冲区，供用户态通过
+ *   CMD_QUERY_SNAPSHOT 查询。
+ *
+ * 寄存器映射（基于 sub_9D68BA0 逆向分析）：
+ *   X19 = Pawn 对象地址（缓存 key）
+ *   X8  = X 坐标（float，低 32 位）
+ *   X9  = Y 坐标（float，低 32 位）
+ *   X10 = Z 坐标（float，低 32 位）
+ *
+ * 注意：overflow handler 运行在中断上下文，只能使用 spinlock
+ *       和原子操作，不能睡眠、不能调用 copy_to/from_user。
+ * =================================================================== */
+
+static void hw_bp_overflow_handler(struct perf_event *event,
+                                    struct perf_sample_data *data,
+                                    struct pt_regs *regs)
+{
+    unsigned long obj_addr;
+    float x, y, z;
+
+    if (!regs)
+        return;
+
+    /* 读取寄存器：X19=Pawn, X8/X9/X10=坐标 */
+    obj_addr = regs->regs[19];
+    x = *(float *)&regs->regs[8];
+    y = *(float *)&regs->regs[9];
+    z = *(float *)&regs->regs[10];
+
+    /* 跳过无效地址 */
+    if (obj_addr < 0x100000)
+        return;
+
+    /* 跳过明显无效的坐标 */
+    if (x == 0.0f && y == 0.0f && z == 0.0f)
+        return;
+
+    spin_lock(&g_snapshot_lock);
+    g_snapshots[g_snapshot_head].obj_addr = obj_addr;
+    g_snapshots[g_snapshot_head].x = x;
+    g_snapshots[g_snapshot_head].y = y;
+    g_snapshots[g_snapshot_head].z = z;
+    g_snapshots[g_snapshot_head].jiffies = jiffies;
+    g_snapshot_head = (g_snapshot_head + 1) % SNAPSHOT_CACHE_SIZE;
+    if (g_snapshot_count < SNAPSHOT_CACHE_SIZE)
+        g_snapshot_count++;
+    spin_unlock(&g_snapshot_lock);
+}
+
+static void hw_bp_cleanup(void)
+{
+    if (g_hw_bp_event) {
+        unregister_user_hw_breakpoint(g_hw_bp_event);
+        g_hw_bp_event = NULL;
+    }
+    if (g_hw_bp_target_task) {
+        put_task_struct(g_hw_bp_target_task);
+        g_hw_bp_target_task = NULL;
+    }
+    g_hw_bp_active = false;
+    g_blr_x8_addr = 0;
+    g_blr_x9_addr = 0;
+
+    spin_lock(&g_snapshot_lock);
+    g_snapshot_head = 0;
+    g_snapshot_count = 0;
+    memset(g_snapshots, 0, sizeof(g_snapshots));
+    spin_unlock(&g_snapshot_lock);
+}
+
+static int hw_bp_setup(struct task_struct *task, unsigned long bp_addr,
+                        unsigned long blr_x8, unsigned long blr_x9)
+{
+    struct perf_event_attr attr;
+    int err;
+
+    /* 先清理旧断点 */
+    hw_bp_cleanup();
+
+    /* 初始化并设置执行断点 */
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = bp_addr;
+    attr.bp_len = HW_BREAKPOINT_LEN_4;   /* A64 指令 = 4 字节 */
+    attr.bp_type = HW_BREAKPOINT_X;       /* 执行断点 */
+
+    g_hw_bp_event = register_user_hw_breakpoint(&attr,
+                         hw_bp_overflow_handler, NULL, task);
+    if (IS_ERR(g_hw_bp_event)) {
+        err = PTR_ERR(g_hw_bp_event);
+        g_hw_bp_event = NULL;
+        pr_err("register_user_hw_breakpoint failed: %d\n", err);
+        return err;
+    }
+
+    g_hw_bp_target_task = task;
+    get_task_struct(task);
+    g_blr_x8_addr = blr_x8;
+    g_blr_x9_addr = blr_x9;
+    g_hw_bp_active = true;
+
+    pr_info("HWBP set: bp=0x%lx blr_x8=0x%lx blr_x9=0x%lx pid=%d\n",
+            bp_addr, blr_x8, blr_x9, task->pid);
+    return 0;
+}
+
+static int hw_bp_update_blr(struct task_struct *task,
+                              unsigned long blr_x8, unsigned long blr_x9)
+{
+    if (!g_hw_bp_active || !g_hw_bp_target_task) {
+        pr_warn("HWBP update_blr: no active breakpoint\n");
+        return -ENODEV;
+    }
+
+    /* 验证目标进程是否匹配 */
+    if (g_hw_bp_target_task != task) {
+        pr_warn("HWBP update_blr: task mismatch (cached=%d new=%d)\n",
+                g_hw_bp_target_task->pid, task->pid);
+        return -EINVAL;
+    }
+
+    g_blr_x8_addr = blr_x8;
+    g_blr_x9_addr = blr_x9;
+    pr_info("HWBP BLR updated: blr_x8=0x%lx blr_x9=0x%lx\n",
+            blr_x8, blr_x9);
+    return 0;
+}
+
+static int hw_bp_query_snapshot(unsigned long obj_addr,
+                                 float *x, float *y, float *z)
+{
+    int i;
+    int found = -2; /* 默认：暂无快照 */
+
+    spin_lock(&g_snapshot_lock);
+    /* 从最新条目开始反向搜索 */
+    for (i = 0; i < g_snapshot_count; i++) {
+        int idx = (g_snapshot_head - 1 - i + SNAPSHOT_CACHE_SIZE) % SNAPSHOT_CACHE_SIZE;
+        if (g_snapshots[idx].obj_addr == obj_addr) {
+            *x = g_snapshots[idx].x;
+            *y = g_snapshots[idx].y;
+            *z = g_snapshots[idx].z;
+            found = 0; /* 命中 */
+            break;
+        }
+    }
+    spin_unlock(&g_snapshot_lock);
+
+    return found;
+}
+#else
+/* CONFIG_HAVE_HW_BREAKPOINT 未启用时的桩函数 */
+static void hw_bp_cleanup(void) {}
+static int hw_bp_setup(struct task_struct *task, unsigned long bp_addr,
+                        unsigned long blr_x8, unsigned long blr_x9) { return -ENOSYS; }
+static int hw_bp_update_blr(struct task_struct *task,
+                              unsigned long blr_x8, unsigned long blr_x9) { return -ENOSYS; }
+static int hw_bp_query_snapshot(unsigned long obj_addr,
+                                 float *x, float *y, float *z) { return -ENOSYS; }
+#endif /* CONFIG_HAVE_HW_BREAKPOINT */
+
 /* ---------- ioctl 处理 ---------- */
 static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
@@ -521,6 +717,48 @@ batch_out:
         break;
     }
 
+    /* ====== HWBP 命令 ====== */
+    case CMD_SET_HW_BP: {
+        unsigned long bp_addr = pkt.addr;
+        unsigned long blr_addrs[2] = {0, 0};
+
+        if (pkt.user_buf && copy_from_user(blr_addrs,
+                (void __user *)pkt.user_buf, sizeof(blr_addrs))) {
+            ret = -EFAULT;
+            break;
+        }
+        ret = hw_bp_setup(task, bp_addr, blr_addrs[0], blr_addrs[1]);
+        break;
+    }
+
+    case CMD_SET_BLR_ADDRS: {
+        unsigned long blr_addrs[2] = {0, 0};
+
+        if (pkt.user_buf && copy_from_user(blr_addrs,
+                (void __user *)pkt.user_buf, sizeof(blr_addrs))) {
+            ret = -EFAULT;
+            break;
+        }
+        ret = hw_bp_update_blr(task, blr_addrs[0], blr_addrs[1]);
+        break;
+    }
+
+    case CMD_QUERY_SNAPSHOT: {
+        unsigned long obj_addr = pkt.addr;
+        float result[3] = {0, 0, 0};
+        int status;
+
+        status = hw_bp_query_snapshot(obj_addr, &result[0], &result[1], &result[2]);
+
+        if (pkt.user_buf && copy_to_user((void __user *)pkt.user_buf,
+                result, sizeof(result))) {
+            ret = -14; /* 用户缓冲区写入失败 */
+        } else {
+            ret = status;
+        }
+        break;
+    }
+
     default:
         ret = -ENOTTY;
     }
@@ -560,12 +798,17 @@ static int __init mem_reader_init(void)
     }
 
     strcpy((char *)THIS_MODULE->name, MODULE_HIDE_NAME);
-    pr_info("device /dev/%s ready (shown as '%s' in lsmod)\n", DEVICE_NAME, MODULE_HIDE_NAME);
+    pr_info("device /dev/%s ready (shown as '%s' in lsmod)"
+#ifdef CONFIG_HAVE_HW_BREAKPOINT
+            " [HWBP supported]"
+#endif
+            "\n", DEVICE_NAME, MODULE_HIDE_NAME);
     return 0;
 }
 
 static void __exit mem_reader_exit(void)
 {
+    hw_bp_cleanup();
     mutex_lock(&g_task_cache_lock);
     clear_task_cache_locked();
     mutex_unlock(&g_task_cache_lock);
@@ -578,4 +821,4 @@ module_exit(mem_reader_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Security Researcher");
-MODULE_DESCRIPTION("Optimized ARM64 memory R/W with batch support and module info");
+MODULE_DESCRIPTION("Optimized ARM64 memory R/W with HWBP snapshot support");
