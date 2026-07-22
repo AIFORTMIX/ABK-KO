@@ -442,7 +442,7 @@ static void hw_bp_overflow_handler(struct perf_event *event,
 static void hw_bp_cleanup(void)
 {
     if (g_hw_bp_event) {
-        unregister_user_hw_breakpoint(g_hw_bp_event);
+        unregister_hw_breakpoint(g_hw_bp_event);
         g_hw_bp_event = NULL;
     }
     if (g_hw_bp_target_task) {
