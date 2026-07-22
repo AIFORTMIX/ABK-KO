@@ -87,6 +87,13 @@ typedef struct {
     unsigned long mem_bytes;          // 模块常驻内存大小（字节）
 } module_info_t;
 
+typedef struct {
+    unsigned long long hit_count;    // 断点触发次数
+    unsigned long long bp_addr;      // 断点地址
+    int snapshot_count;              // 当前快照缓存条目数
+    int active;                      // 1=激活, 0=未激活
+} hwbp_stats_t;
+
 #define MEM_IOCTL_MAGIC 'Q'
 #define CMD_GET_BASE            _IOWR(MEM_IOCTL_MAGIC, 1, mem_packet_t)
 #define CMD_READ_MEM            _IOWR(MEM_IOCTL_MAGIC, 2, mem_packet_t)
@@ -97,6 +104,7 @@ typedef struct {
 #define CMD_SET_HW_BP           _IOW(MEM_IOCTL_MAGIC, 7, mem_packet_t)
 #define CMD_SET_BLR_ADDRS       _IOW(MEM_IOCTL_MAGIC, 8, mem_packet_t)
 #define CMD_QUERY_SNAPSHOT      _IOWR(MEM_IOCTL_MAGIC, 9, mem_packet_t)
+#define CMD_GET_HWBP_STATS      _IOR(MEM_IOCTL_MAGIC, 10, hwbp_stats_t)
 
 #define QW_BATCH_MAX_ITEMS 512
 #define QW_BATCH_MAX_SIZE  (2 * 1024 * 1024)
@@ -117,6 +125,7 @@ static struct task_struct *g_hw_bp_target_task = NULL;
 static unsigned long g_blr_x8_addr = 0;
 static unsigned long g_blr_x9_addr = 0;
 static bool g_hw_bp_active = false;
+static atomic64_t g_hw_bp_hit_count = ATOMIC64_INIT(0);
 
 /* ---------- 坐标快照缓存（环形缓冲区，spinlock 保护） ---------- */
 #define SNAPSHOT_CACHE_SIZE 256
@@ -463,6 +472,8 @@ static void hw_bp_overflow_handler(struct perf_event *event,
     if (g_snapshot_count < SNAPSHOT_CACHE_SIZE)
         g_snapshot_count++;
     spin_unlock(&g_snapshot_lock);
+
+    atomic64_inc(&g_hw_bp_hit_count);
 }
 
 static void hw_bp_cleanup(void)
@@ -594,6 +605,26 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         info.call_count = atomic64_read(&g_call_count);
         info.mem_bytes = THIS_MODULE->core_layout.size;
         if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+            ret = -EFAULT;
+        else
+            ret = 0;
+        goto out;
+    }
+
+    if (cmd == CMD_GET_HWBP_STATS) {
+        hwbp_stats_t stats;
+        memset(&stats, 0, sizeof(stats));
+#ifdef CONFIG_HAVE_HW_BREAKPOINT
+        stats.hit_count = atomic64_read(&g_hw_bp_hit_count);
+        if (g_hw_bp_event) {
+            stats.bp_addr = g_hw_bp_event->attr.bp_addr;
+        }
+        stats.snapshot_count = g_snapshot_count;
+        stats.active = g_hw_bp_active ? 1 : 0;
+#else
+        stats.active = 0;
+#endif
+        if (copy_to_user((void __user *)arg, &stats, sizeof(stats)))
             ret = -EFAULT;
         else
             ret = 0;
