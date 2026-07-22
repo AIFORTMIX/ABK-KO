@@ -603,7 +603,11 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         module_info_t info;
         info.cpu_time_ns = atomic64_read(&g_total_cpu_ns);
         info.call_count = atomic64_read(&g_call_count);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+        info.mem_bytes = THIS_MODULE->core.size;
+#else
         info.mem_bytes = THIS_MODULE->core_layout.size;
+#endif
         if (copy_to_user((void __user *)arg, &info, sizeof(info)))
             ret = -EFAULT;
         else
