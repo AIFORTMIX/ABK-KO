@@ -603,11 +603,13 @@ static long device_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         module_info_t info;
         info.cpu_time_ns = atomic64_read(&g_total_cpu_ns);
         info.call_count = atomic64_read(&g_call_count);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-        /* 针对 Android 6.6 内核，很多保留 core_size 直接成员 */
-        info.mem_bytes = THIS_MODULE->core_size;
-#else
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+        /* 5.x 及更早内核使用 core_layout.size */
         info.mem_bytes = THIS_MODULE->core_layout.size;
+#else
+        /* 6.x 内核（含 Android 6.6）中 struct module 内存大小成员未统一，
+         * 暂时返回 0，避免编译错误，不影响其他功能 */
+        info.mem_bytes = 0;
 #endif
         if (copy_to_user((void __user *)arg, &info, sizeof(info)))
             ret = -EFAULT;
